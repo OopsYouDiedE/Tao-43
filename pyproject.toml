@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vjepa-gym"
+version = "0.1.0"
+description = "Rollback-capable MuJoCo environments for V-JEPA planning experiments."
+readme = "readme.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dm_control>=1.0.20",
+    "gymnasium>=0.29.0",
+    "h5py>=3.10.0",
+    "mujoco>=3.1.0",
+    "numpy>=1.24.0",
+    "torch>=2.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["vjepa_gym*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

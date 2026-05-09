@@ -1,7 +1,13 @@
 # VJEPA-Gym 完整设计方案
 
 > 基于 V-JEPA 2.1 的可回滚物理仿真框架，目标：复现动物认知基准任务
-
+>
+> **注意**：V-JEPA 2.1 于 2026-03-16 正式发布（arXiv:2603.14482），所有变体均采用 **384×384px** 输入，patch 数量为 24×24=**576**（而非 V-JEPA 2 的 256px/196 patches）。本文档已据此更新。
+目标：
+1. 实现可回滚环境用来提供给决策器作为替代性决策树方案。
+2. 能够使用无监督随机生成数据训练模型action head。
+3. 能够在必要情况下，使用合成数据来微调V-JEPA。
+4. 在达成前三条任务的前提下，设计几个动物学习环境，并验证世界模型的能力。
 ---
 
 ## 0. 设计原则与核心约束
@@ -104,21 +110,21 @@ vjepa_gym/
 ### 2.1 数据流与张量尺寸约定
 
 ```
-输入视频片段：  [B, T, C, H, W]  = [B, 8, 3, 224, 224]
-                                     ↑帧数上限，推理时可以更少
+输入视频片段：  [B, T, C, H, W]  = [B, 8, 3, 384, 384]
+                                     ↑帧数上限，推理时可以更少  ↑ V-JEPA 2.1 要求 384px
 
-Encoder输出：   [B, T, N, D]     = [B, 8, 196, 1024]
-                                        ↑ 14×14 patches   ↑ ViT-L hidden dim
+Encoder输出：   [B, T, N, D]     = [B, 8, 576, 1024]
+                                        ↑ 24×24 patches   ↑ ViT-L hidden dim
 
 AC-Predictor输入序列（每帧）：
   action_token:    [B, 1, 768]   ← action_proj(7 → 768)
   state_token:     [B, 1, 768]   ← state_proj(7 → 768)
-  visual_tokens:   [B, 196, 768] ← visual_proj(1024 → 768)
-  拼接后：         [B, 198, 768] per frame
-  全序列：         [B, T×198, 768]
+  visual_tokens:   [B, 576, 768] ← visual_proj(1024 → 768)
+  拼接后：         [B, 578, 768] per frame
+  全序列：         [B, T×578, 768]
 
-AC-Predictor输出：[B, T, 196, 1024]  ← 还原回encoder embedding dim
-目标（教师）：    [B, T, 196, 1024]  ← frozen encoder对下一帧的输出
+AC-Predictor输出：[B, T, 576, 1024]  ← 还原回encoder embedding dim
+目标（教师）：    [B, T, 576, 1024]  ← frozen encoder对下一帧的输出
 ```
 
 ### 2.2 loader.py
@@ -137,14 +143,26 @@ from typing import Optional
 
 class VJEPAEncoder(nn.Module):
     """
-    封装官方V-JEPA 2.1 ViT-L encoder。
+    封装官方 V-JEPA 2.1 ViT-L encoder。
     对外只暴露 encode() 接口，屏蔽内部细节。
+
+    重要：V-JEPA 2.1 全部变体都采用 384px 输入，对应的 hub 名称为：
+      vitb → 'vjepa2_1_vit_base_384'
+      vitl → 'vjepa2_1_vit_large_384'  (推荐)
+      vitg → 'vjepa2_1_vit_giant_384'
+      vitG → 'vjepa2_1_vit_gigantic_384'
+    注意：若需要官方 AC-Predictor，应改用 vjepa2_ac_vit_giant
     """
 
     SUPPORTED_VARIANTS = {
-        'vitb': 'vjepa2_vit_base',
-        'vitl': 'vjepa2_vit_large',
+        'vitb': 'vjepa2_1_vit_base_384',
+        'vitl': 'vjepa2_1_vit_large_384',
+        'vitg': 'vjepa2_1_vit_giant_384',
+        'vitG': 'vjepa2_1_vit_gigantic_384',
     }
+
+    # V-JEPA 2.1 全部变体都是 384px 输入
+    IMAGE_SIZE = 384
 
     def __init__(self, variant: str = 'vitl', device: str = 'cuda'):
         super().__init__()
@@ -168,9 +186,8 @@ class VJEPAEncoder(nn.Module):
         self.device = device
 
     def _infer_embed_dim(self) -> int:
-        dims = {'vitb': 768, 'vitl': 1024}
-        # 通过实际前向推理确认维度
-        dummy = torch.zeros(1, 1, 3, 224, 224, device=self.device)
+        # 通过实际前向推理确认维度（花注意使用 IMAGE_SIZE）
+        dummy = torch.zeros(1, 1, 3, self.IMAGE_SIZE, self.IMAGE_SIZE, device=self.device)
         with torch.no_grad():
             out = self.backbone(dummy)
         return out.shape[-1]
@@ -180,11 +197,14 @@ class VJEPAEncoder(nn.Module):
         """
         Args:
             frames: [B, T, C, H, W]，像素值 [0, 1]，已做normalize
+                    H=W=384（V-JEPA 2.1 要求）
         Returns:
             z: [B, T, N_patches, embed_dim]
-               N_patches = (H/patch_size) * (W/patch_size) = 14*14 = 196
+               N_patches = (384/16) * (384/16) = 24*24 = 576
         """
         B, T, C, H, W = frames.shape
+        assert H == self.IMAGE_SIZE and W == self.IMAGE_SIZE, \
+            f"V-JEPA 2.1 要求 {self.IMAGE_SIZE}px 输入，得到 {H}x{W}"
         # encoder逐帧处理，合并batch和time维度
         frames_flat = rearrange(frames, 'b t c h w -> (b t) c h w')
         # 添加fake时间维（官方encoder期望[B, T, C, H, W]，但可单帧运行）
@@ -291,15 +311,17 @@ class ACPredictor(nn.Module):
     Action-Conditional Predictor。
 
     Architecture:
-      - 4个独立线性投影（visual / action / state 各一个）
+      - 3路独立线性投影（visual / action / state 各一个）
       - 12层 ACBlock（block-causal attention）
       - 输出投影回encoder embedding dim
     
-    参数量估算（dim=768，12层，N=196）：
+    参数量估算（dim=768，12层，N=576，V-JEPA 2.1 ViT-L 384px）：
       投影层：~3M
       Transformer：~85M
       输出层：~0.8M
       总计：~89M
+    注意： N=576（384px/16=24, 24×24=576），显存占用相比 196 patches 大幅增加，
+    CEM 规划的候选数量建议根据实际GPU内存调整。
     """
 
     TOKENS_PER_FRAME = 2  # action_token + state_token（visual_tokens另算）
@@ -308,7 +330,7 @@ class ACPredictor(nn.Module):
         self,
         encoder_dim: int = 1024,    # V-JEPA 2.1 ViT-L输出维度
         predictor_dim: int = 768,   # AC-Predictor内部维度
-        n_patches: int = 196,       # 14×14
+        n_patches: int = 576,       # 24×24（V-JEPA 2.1 @ 384px）
         action_dim: int = 7,        # Delta Cartesian + gripper
         state_dim: int = 7,         # 末端位姿绝对值
         n_layers: int = 12,
@@ -344,11 +366,31 @@ class ACPredictor(nn.Module):
         # 输出投影：还原回encoder dim（MSE loss用）
         self.output_proj = nn.Linear(predictor_dim, encoder_dim)
 
-        # 时间RoPE（用于action/state token）
+        # 时间RoPE（应用于action/state token的位置编码）
         self.rope = RotaryEmbedding(predictor_dim // n_heads, max_seq_len=max_frames)
 
         # 预计算causal mask（在forward中按实际T动态截取）
         self._precompute_masks(max_frames)
+
+    def _apply_rope(
+        self,
+        x: torch.Tensor,    # [B, T*(N+2), predictor_dim]
+        T: int,
+    ) -> torch.Tensor:
+        """
+        对每帧的 action_token 和 state_token 注入 RoPE 位置编码。
+        visual_tokens 继续用空间 patch 位置编码（由 encoder 自带）。
+        """
+        rope_emb = self.rope(T, x.device)  # [1, T, predictor_dim]
+        # 仅对每帧的前 2 个 token（action + state）注入时间位置编码
+        x = x.clone()
+        for t in range(T):
+            token_start = t * self.n_per_frame
+            # action token
+            x[:, token_start, :] = x[:, token_start, :] + rope_emb[:, t, :]
+            # state token
+            x[:, token_start + 1, :] = x[:, token_start + 1, :] + rope_emb[:, t, :]
+        return x
 
     def _precompute_masks(self, max_frames: int):
         masks = {}
@@ -399,6 +441,9 @@ class ACPredictor(nn.Module):
         # Token interleaving
         x = self.interleave_tokens(z, actions, states)  # [B, T*(N+2), predictor_dim]
 
+        # 对 action/state token 注入 RoPE 时间位置编码
+        x = self._apply_rope(x, T)
+
         # Block-causal attention mask
         attn_mask = self._get_causal_mask(T, z.device)  # [T*(N+2), T*(N+2)]
 
@@ -424,17 +469,25 @@ class ACPredictor(nn.Module):
     ) -> torch.Tensor:
         """
         单步自回归推理接口（规划时使用）。
+        使用完整的 context 窗口（而非只取最后一帧）以保留时间信息。
+        循context 就是上一步预测的 z_next 加到尾部后的滑动窗口。
         Returns:
             z_next: [B, N, encoder_dim] 预测的下一帧潜向量
         """
-        B = z_ctx.shape[0]
+        B, T_ctx, N, D = z_ctx.shape
         action = action.unsqueeze(1)  # [B, 1, action_dim]
         state = state.unsqueeze(1)    # [B, 1, state_dim]
 
-        # 只用最后一帧的context做预测（单步）
-        z_last = z_ctx[:, -1:, :, :]  # [B, 1, N, encoder_dim]
-        z_pred = self.forward(z_last, action, state)  # [B, 1, N, encoder_dim]
-        return z_pred[:, 0, :, :]  # [B, N, encoder_dim]
+        # 利用完整 context 窗口（最大 max_frames 帧）
+        # 对最后一帧的预测：用全部 T_ctx 帧作为 context，采不同 动作/状态 递入
+        # 动作/状态序列：将 context 中的历史动作（未知）用零占位，只对最后一帧填当前 action
+        actions_ctx = torch.zeros(B, T_ctx, action.shape[-1], device=z_ctx.device)
+        states_ctx = torch.zeros(B, T_ctx, state.shape[-1], device=z_ctx.device)
+        actions_ctx[:, -1:, :] = action
+        states_ctx[:, -1:, :] = state
+
+        z_pred = self.forward(z_ctx, actions_ctx, states_ctx)  # [B, T_ctx, N, encoder_dim]
+        return z_pred[:, -1, :, :]  # [B, N, encoder_dim] 取最后一帧的预测
 ```
 
 ### 2.4 model_bundle.py
@@ -454,7 +507,7 @@ from dataclasses import dataclass
 
 @dataclass
 class ModelConfig:
-    encoder_variant: str = 'vitl'      # 'vitb' | 'vitl'
+    encoder_variant: str = 'vitl'      # 'vitb' | 'vitl' | 'vitg' | 'vitG'  (V-JEPA 2.1)
     predictor_dim: int = 768
     predictor_layers: int = 12
     predictor_heads: int = 12
@@ -554,8 +607,8 @@ class RollbackEnv:
         self,
         physics: mjc.Physics,
         frame_buffer_len: int = 8,
-        render_width: int = 224,
-        render_height: int = 224,
+        render_width: int = 384,   # V-JEPA 2.1 要求 384px 输入
+        render_height: int = 384,  # V-JEPA 2.1 要求 384px 输入
         camera_id: int = 0,
     ):
         self.physics = physics
@@ -645,6 +698,7 @@ class RollbackEnv:
         """
         返回当前frame_buffer内容，格式化为encoder输入。
         Returns: [1, T, C, H, W]，像素值归一化到[0,1]
+                 H=W=384（与V-JEPA 2.1 要求对齐）
         """
         frames = np.stack(list(self.frame_buffer), axis=0)  # [T, H, W, C]
         frames = frames.transpose(0, 3, 1, 2).astype(np.float32) / 255.0  # [T, C, H, W]
@@ -1250,8 +1304,13 @@ class BackboneFinetune:
         with torch.no_grad():
             z_target = self.ema_encoder.encode(frames)  # [B, T, N, D]
 
-        # Online encoder前向（简化：全帧输入，用mask在loss上屏蔽）
-        z_online = self.encoder.encode.__wrapped__(frames)  # 绕过no_grad
+        # Online encoder前向（必须绕过 @torch.no_grad() 装饰，直接调用 backbone）
+        # 注意：不能用 self.encoder.encode.__wrapped__（不存在），
+        #       应直接调用 backbone 的 forward 方法并包裹 rearrange
+        B, T, C, H, W = frames.shape
+        frames_flat = frames.reshape(B * T, 1, C, H, W)       # [(B*T), 1, C, H, W]
+        z_flat = self.encoder.backbone(frames_flat)             # [(B*T), 1, N, D]
+        z_online = z_flat.reshape(B, T, z_flat.shape[2], z_flat.shape[3])  # [B, T, N, D]
         # V-JEPA 2.1 Deep Self-Supervision：多层loss（简化为最后一层）
         loss = F.smooth_l1_loss(z_online, z_target.detach())
 
@@ -1536,10 +1595,12 @@ class TrajectoryDataset(Dataset):
 ```yaml
 encoder:
   variant: vitl           # ViT-L encoder
+  hub_name: vjepa2_1_vit_large_384  # V-JEPA 2.1 官方 hub 名称
   device: cuda
   embed_dim: 1024         # 固定，由官方模型决定
   patch_size: 16
-  image_size: 224
+  image_size: 384         # V-JEPA 2.1 要求 384px（非 224px）
+  n_patches: 576          # 24×24 = 576（即 (384/16)^2）
 
 predictor:
   predictor_dim: 768      # AC-Predictor内部维度
@@ -1680,16 +1741,16 @@ data:
 ```python
 # 加载模型
 from models.model_bundle import ModelBundle, ModelConfig
-bundle = ModelBundle(ModelConfig(encoder_variant='vitl'))
+bundle = ModelBundle(ModelConfig(encoder_variant='vitl'))  # 调用 vjepa2_1_vit_large_384
 
-# 创建环境
+# 创建环境（render_width/height 默认已是 384）
 from env.tasks.nut_crushing import NutCrushingEnv
 env = NutCrushingEnv()
 obs = env.reset()
 
 # 编码当前观测
-frames = env.get_frame_tensor(device='cuda')    # [1, 8, 3, 224, 224]
-z = bundle.encode(frames)                        # [1, 8, 196, 1024]
+frames = env.get_frame_tensor(device='cuda')    # [1, 8, 3, 384, 384]
+z = bundle.encode(frames)                        # [1, 8, 576, 1024]
 
 # 规划
 from planning.latent_rollout import LatentRollout
@@ -1697,8 +1758,8 @@ from planning.cem_planner import CEMPlanner
 rollout = LatentRollout(bundle)
 planner = CEMPlanner(bundle, rollout)
 
-goal_img = load_goal_image('assets/goals/nut_crushed.png')
-z_goal = bundle.encode_goal(goal_img)            # [1, 196, 1024]
+goal_img = load_goal_image('assets/goals/nut_crushed.png')  # [1, 3, 384, 384]
+z_goal = bundle.encode_goal(goal_img)            # [1, 576, 1024]
 state = env.get_state_vector()
 
 best_actions, cost = planner.plan(z, z_goal, torch.tensor(state))

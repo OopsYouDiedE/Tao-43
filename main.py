@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
+import math
+import os
 import random
 import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
+import h5py
 import imageio.v2 as imageio
 import numpy as np
 import torch
 import yaml
+from torch.utils.data import DataLoader
 
 from core_models import ActionConditionedPredictor, PredictorConfig, TOKENS_PER_FRAME, VJEPAEncoder, mean_patch_cost
 from environment import make_smoke_env
 from latent_planner import LatentCEMPlanner, OracleCEMPlanner, oracle_cem_config_from_dict, cem_config_from_dict
-from trainer_engine import compute_ac_predictor_loss
+from trainer_engine import HDF5WindowDataset, compute_ac_predictor_latent_loss, compute_ac_predictor_loss
 
 
 def load_config(path: str) -> dict:
@@ -36,6 +43,15 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def frames_to_tensor(frames: list[np.ndarray] | np.ndarray, device: torch.device | str | None = None) -> torch.Tensor:
+    array = np.asarray(frames)
+    if array.ndim != 4 or array.shape[-1] != 3:
+        raise ValueError(f"frames must be [T, H, W, 3], got {array.shape}")
+    array = array.astype(np.float32) / 255.0
+    tensor = torch.from_numpy(array).permute(0, 3, 1, 2).unsqueeze(0)
+    return tensor.to(device) if device else tensor
 
 
 def assert_python_310() -> None:
@@ -342,6 +358,1149 @@ def run_oracle_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_collect_synthetic(args: argparse.Namespace) -> int:
+    assert_python_310()
+    config = load_config(args.config)
+    set_seed(int(args.seed if args.seed is not None else config.get("seed", 43)))
+    device = select_device(config)
+    rng = np.random.default_rng(int(args.seed if args.seed is not None else config.get("seed", 43)))
+    print(f"python: {sys.version.split()[0]}")
+    print(f"torch: {torch.__version__}")
+    print(f"device: {device}")
+
+    encoder = build_encoder(config, args.require_official_vjepa, device)
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists():
+        output.unlink()
+
+    demo_cfg = dict(config.get("oracle_demo", {}))
+    oracle_cfg = oracle_cem_config_from_dict(
+        {
+            "horizon": max(args.sequence_len, int(args.oracle_horizon or demo_cfg.get("horizon", 8))),
+            "n_candidates": int(args.oracle_candidates or demo_cfg.get("n_candidates", 32)),
+            "n_elites": int(args.oracle_elites or demo_cfg.get("n_elites", 8)),
+            "n_iters": int(args.oracle_iters or demo_cfg.get("n_iters", 3)),
+            "action_dims": 2,
+            "action_repeat": int(args.action_repeat),
+            "distance_cost_weight": float(demo_cfg.get("distance_cost_weight", 0.0)),
+            "use_action_priors": bool(demo_cfg.get("use_action_priors", False)),
+            "encode_batch_size": int(args.encode_batch_size or demo_cfg.get("encode_batch_size", 4)),
+            "topk_visualize": 1,
+            "seed": int(args.seed if args.seed is not None else config.get("seed", 43)),
+        }
+    )
+    planner = OracleCEMPlanner(encoder=encoder, config=oracle_cfg, device=device)
+    env = make_smoke_env(config["environment"])
+
+    with h5py.File(output, "w") as h5:
+        h5.attrs["seed"] = int(args.seed if args.seed is not None else config.get("seed", 43))
+        h5.attrs["sequence_len"] = int(args.sequence_len)
+        h5.attrs["action_repeat"] = int(args.action_repeat)
+        h5.attrs["source_ratios"] = "oracle=0.60,directional=0.25,random=0.15"
+        h5.attrs["oracle_config"] = repr(oracle_cfg)
+        _collect_synthetic_split(
+            h5=h5,
+            split="train",
+            windows=int(args.train_windows),
+            env=env,
+            planner=planner,
+            encoder=encoder,
+            device=device,
+            rng=rng,
+            sequence_len=int(args.sequence_len),
+            action_repeat=int(args.action_repeat),
+            target_steps=int(args.target_steps),
+        )
+        _collect_synthetic_split(
+            h5=h5,
+            split="val",
+            windows=int(args.val_windows),
+            env=env,
+            planner=planner,
+            encoder=encoder,
+            device=device,
+            rng=rng,
+            sequence_len=int(args.sequence_len),
+            action_repeat=int(args.action_repeat),
+            target_steps=int(args.target_steps),
+        )
+
+    print(f"synthetic dataset: {output}")
+    print("collect-synthetic: ok")
+    return 0
+
+
+def run_collect_latent_shards(args: argparse.Namespace) -> int:
+    assert_python_310()
+    config = load_config(args.config)
+    seed = int(args.seed if args.seed is not None else config.get("seed", 43))
+    set_seed(seed)
+    device = select_device(config)
+    rng = np.random.default_rng(seed)
+    print(f"python: {sys.version.split()[0]}")
+    print(f"torch: {torch.__version__}")
+    print(f"device: {device}")
+
+    encoder = build_encoder(config, args.require_official_vjepa, device).eval()
+    for param in encoder.parameters():
+        param.requires_grad_(False)
+
+    out_dir = Path(args.output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    demo_cfg = dict(config.get("oracle_demo", {}))
+    oracle_cfg = oracle_cem_config_from_dict(
+        {
+            "horizon": max(int(args.sequence_len), int(args.oracle_horizon or demo_cfg.get("horizon", 8))),
+            "n_candidates": int(args.oracle_candidates),
+            "n_elites": int(args.oracle_elites),
+            "n_iters": int(args.oracle_iters),
+            "action_dims": 2,
+            "action_repeat": int(args.action_repeat),
+            "distance_cost_weight": float(demo_cfg.get("distance_cost_weight", 0.0)),
+            "use_action_priors": bool(demo_cfg.get("use_action_priors", False)),
+            "encode_batch_size": int(args.encode_batch_size),
+            "topk_visualize": 1,
+            "seed": seed,
+        }
+    )
+    planner = OracleCEMPlanner(encoder=encoder, config=oracle_cfg, device=device)
+    env = make_smoke_env(config["environment"])
+
+    _collect_latent_split(
+        split="train",
+        windows=int(args.train_windows),
+        out_dir=out_dir,
+        env=env,
+        planner=planner,
+        encoder=encoder,
+        device=device,
+        rng=rng,
+        sequence_len=int(args.sequence_len),
+        action_repeat=int(args.action_repeat),
+        target_steps=int(args.target_steps),
+        shard_size=int(args.shard_size),
+        encode_batch_size=int(args.encode_batch_size),
+        amp=bool(args.amp),
+        resume=bool(args.resume),
+        seed=seed,
+        oracle_cfg=oracle_cfg,
+    )
+    _collect_latent_split(
+        split="val",
+        windows=int(args.val_windows),
+        out_dir=out_dir,
+        env=env,
+        planner=planner,
+        encoder=encoder,
+        device=device,
+        rng=rng,
+        sequence_len=int(args.sequence_len),
+        action_repeat=int(args.action_repeat),
+        target_steps=int(args.target_steps),
+        shard_size=int(args.shard_size),
+        encode_batch_size=int(args.encode_batch_size),
+        amp=bool(args.amp),
+        resume=bool(args.resume),
+        seed=seed,
+        oracle_cfg=oracle_cfg,
+    )
+
+    print(f"latent shards: {out_dir}")
+    print("collect-latent-shards: ok")
+    return 0
+
+
+def run_train_ac_latent(args: argparse.Namespace) -> int:
+    assert_python_310()
+    config = load_config(args.config)
+    seed = int(args.seed if args.seed is not None else config.get("seed", 43))
+    set_seed(seed)
+    device = select_device(config)
+    rng = np.random.default_rng(seed)
+    print(f"python: {sys.version.split()[0]}")
+    print(f"torch: {torch.__version__}")
+    print(f"device: {device}")
+
+    predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).train()
+    optimizer = torch.optim.AdamW(predictor.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    use_amp = bool(args.amp) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    data_dir = Path(args.data_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = output_dir / "latest.pt"
+    metrics_path = output_dir / "latent_metrics.csv"
+    history: list[dict[str, float]] = []
+    if args.resume_checkpoint:
+        checkpoint = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+        predictor.load_state_dict(checkpoint["predictor"])
+        if "optimizer" in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except ValueError as exc:
+                print(f"warning: could not restore optimizer state from {args.resume_checkpoint}: {exc}")
+        history = list(checkpoint.get("metrics", []))
+        print(f"resumed predictor checkpoint: {Path(args.resume_checkpoint).resolve()}")
+        del checkpoint
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    with metrics_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "phase",
+                "index",
+                "shards",
+                "loss",
+                "loss_tf",
+                "loss_roll",
+                "loss_delta",
+                "loss_delta_roll",
+                "loss_action_contrast",
+            ],
+        )
+        writer.writeheader()
+
+        if args.watch:
+            processed: set[Path] = set()
+            expected_train = int(args.expected_train_shards or 0)
+            expected_val = int(args.expected_val_shards or 0)
+            while True:
+                train_shards = _list_complete_latent_shards(data_dir, "train")
+                new_shards = [path for path in train_shards if path not in processed]
+                for shard in new_shards:
+                    metrics = _train_latent_shard(
+                        predictor=predictor,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        shard=shard,
+                        device=device,
+                        batch_size=int(args.batch_size),
+                        grad_accum=int(args.grad_accum),
+                        rollout_steps=int(args.rollout_steps),
+                        use_amp=use_amp,
+                        rng=rng,
+                        condition_on_state=bool(args.condition_on_state),
+                    )
+                    processed.add(shard)
+                    row = {
+                        "phase": "watch",
+                        "index": float(len(processed)),
+                        "shards": float(len(train_shards)),
+                        "loss": metrics["loss_total"],
+                        "loss_tf": metrics["loss_tf"],
+                        "loss_roll": metrics["loss_roll"],
+                        "loss_delta": metrics["loss_delta"],
+                        "loss_delta_roll": metrics["loss_delta_roll"],
+                        "loss_action_contrast": metrics["loss_action_contrast"],
+                    }
+                    writer.writerow(row)
+                    handle.flush()
+                    history.append(row)
+                    _save_latent_checkpoint(latest_path, predictor, optimizer, config, args, history)
+                    print(
+                        f"watch shard={shard.name} loss={row['loss']:.6f} "
+                        f"seen={len(processed)}/{expected_train or '?'}"
+                    )
+
+                train_done = expected_train > 0 and len(train_shards) >= expected_train and len(processed) >= expected_train
+                val_done = expected_val <= 0 or len(_list_complete_latent_shards(data_dir, "val")) >= expected_val
+                if train_done and val_done:
+                    break
+                if not new_shards and args.replay_while_waiting and train_shards:
+                    shard = Path(rng.choice(train_shards))
+                    metrics = _train_latent_shard(
+                        predictor=predictor,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        shard=shard,
+                        device=device,
+                        batch_size=int(args.batch_size),
+                        grad_accum=int(args.grad_accum),
+                        rollout_steps=int(args.rollout_steps),
+                        use_amp=use_amp,
+                        rng=rng,
+                        condition_on_state=bool(args.condition_on_state),
+                    )
+                    row = {
+                        "phase": "replay",
+                        "index": float(len(history) + 1),
+                        "shards": float(len(train_shards)),
+                        "loss": metrics["loss_total"],
+                        "loss_tf": metrics["loss_tf"],
+                        "loss_roll": metrics["loss_roll"],
+                        "loss_delta": metrics["loss_delta"],
+                        "loss_delta_roll": metrics["loss_delta_roll"],
+                        "loss_action_contrast": metrics["loss_action_contrast"],
+                    }
+                    writer.writerow(row)
+                    handle.flush()
+                    history.append(row)
+                    _save_latent_checkpoint(latest_path, predictor, optimizer, config, args, history)
+                    print(f"replay shard={shard.name} loss={row['loss']:.6f} available={len(train_shards)}")
+                    continue
+                time.sleep(float(args.poll_seconds))
+
+        for epoch in range(1, int(args.epochs) + 1):
+            train_shards = _list_complete_latent_shards(data_dir, "train")
+            if not train_shards:
+                raise RuntimeError(f"No complete train shards found in {data_dir}.")
+            rng.shuffle(train_shards)
+            totals = {
+                "loss_tf": 0.0,
+                "loss_roll": 0.0,
+                "loss_delta": 0.0,
+                "loss_delta_roll": 0.0,
+                "loss_action_contrast": 0.0,
+                "loss_total": 0.0,
+            }
+            for shard in train_shards:
+                metrics = _train_latent_shard(
+                    predictor=predictor,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    shard=shard,
+                    device=device,
+                    batch_size=int(args.batch_size),
+                    grad_accum=int(args.grad_accum),
+                    rollout_steps=int(args.rollout_steps),
+                    use_amp=use_amp,
+                    rng=rng,
+                    condition_on_state=bool(args.condition_on_state),
+                )
+                for key in totals:
+                    totals[key] += metrics[key]
+            train_metrics = {key: value / len(train_shards) for key, value in totals.items()}
+            val_shards = _list_complete_latent_shards(data_dir, "val")
+            val_metrics = _evaluate_latent_shards(
+                predictor=predictor,
+                shards=val_shards,
+                device=device,
+                batch_size=int(args.batch_size),
+                rollout_steps=int(args.rollout_steps),
+                use_amp=use_amp,
+                condition_on_state=bool(args.condition_on_state),
+            ) if val_shards else {"loss_tf": float("nan"), "loss_roll": float("nan"), "loss_total": float("nan")}
+            row = {
+                "phase": "epoch",
+                "index": float(epoch),
+                "shards": float(len(train_shards)),
+                "loss": train_metrics["loss_total"],
+                "loss_tf": train_metrics["loss_tf"],
+                "loss_roll": train_metrics["loss_roll"],
+                "loss_delta": train_metrics["loss_delta"],
+                "loss_delta_roll": train_metrics["loss_delta_roll"],
+                "loss_action_contrast": train_metrics["loss_action_contrast"],
+            }
+            writer.writerow(row)
+            writer.writerow(
+                {
+                    "phase": "val",
+                    "index": float(epoch),
+                    "shards": float(len(val_shards)),
+                    "loss": val_metrics["loss_total"],
+                    "loss_tf": val_metrics["loss_tf"],
+                    "loss_roll": val_metrics["loss_roll"],
+                    "loss_delta": val_metrics["loss_delta"],
+                    "loss_delta_roll": val_metrics["loss_delta_roll"],
+                    "loss_action_contrast": val_metrics["loss_action_contrast"],
+                }
+            )
+            handle.flush()
+            history.extend([row, {"phase": "val", "index": float(epoch), **val_metrics}])
+            _save_latent_checkpoint(latest_path, predictor, optimizer, config, args, history)
+            print(
+                f"epoch={epoch:03d} train={train_metrics['loss_total']:.6f} "
+                f"val={val_metrics['loss_total']:.6f} shards={len(train_shards)}"
+            )
+
+    print(f"checkpoint: {latest_path}")
+    print("train-ac-latent: ok")
+    return 0
+
+
+def run_pipeline_latent(args: argparse.Namespace) -> int:
+    root = Path.cwd().resolve()
+    run_dir = Path(args.run_dir).resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(args.data_dir).resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    train_shards = math.ceil(int(args.train_windows) / int(args.shard_size))
+    val_shards = math.ceil(int(args.val_windows) / int(args.shard_size))
+    collector_log = (run_dir / "collector.log").open("w", encoding="utf-8")
+    trainer_log = (run_dir / "trainer.log").open("w", encoding="utf-8")
+
+    base = [sys.executable, "main.py"]
+    collector_cmd = base + [
+        "collect-latent-shards",
+        "--require-official-vjepa",
+        "--output-dir",
+        str(data_dir),
+        "--train-windows",
+        str(args.train_windows),
+        "--val-windows",
+        str(args.val_windows),
+        "--shard-size",
+        str(args.shard_size),
+        "--oracle-candidates",
+        str(args.oracle_candidates),
+        "--oracle-elites",
+        str(args.oracle_elites),
+        "--oracle-iters",
+        str(args.oracle_iters),
+        "--encode-batch-size",
+        str(args.encode_batch_size),
+    ]
+    trainer_cmd = base + [
+        "train-ac-latent",
+        "--data-dir",
+        str(data_dir),
+        "--output-dir",
+        str(Path(args.output_dir).resolve()),
+        "--watch",
+        "--expected-train-shards",
+        str(train_shards),
+        "--expected-val-shards",
+        str(val_shards),
+        "--replay-while-waiting",
+        "--epochs",
+        str(args.final_epochs),
+        "--batch-size",
+        str(args.batch_size),
+        "--grad-accum",
+        str(args.grad_accum),
+    ]
+    if bool(args.condition_on_state):
+        trainer_cmd.append("--condition-on-state")
+    print(f"collector log: {collector_log.name}")
+    print(f"trainer log: {trainer_log.name}")
+    collector = subprocess.Popen(collector_cmd, cwd=root, stdout=collector_log, stderr=subprocess.STDOUT)
+    trainer = subprocess.Popen(trainer_cmd, cwd=root, stdout=trainer_log, stderr=subprocess.STDOUT)
+    (run_dir / "collector.pid").write_text(str(collector.pid), encoding="utf-8")
+    (run_dir / "trainer.pid").write_text(str(trainer.pid), encoding="utf-8")
+    try:
+        while True:
+            collector_code = collector.poll()
+            trainer_code = trainer.poll()
+            if collector_code is not None and collector_code != 0:
+                trainer.terminate()
+                raise RuntimeError(f"collector failed with exit code {collector_code}; see {collector_log.name}")
+            if trainer_code is not None and trainer_code != 0:
+                collector.terminate()
+                raise RuntimeError(f"trainer failed with exit code {trainer_code}; see {trainer_log.name}")
+            if collector_code == 0 and trainer_code == 0:
+                break
+            time.sleep(10.0)
+    finally:
+        collector_log.close()
+        trainer_log.close()
+    print("pipeline-latent: ok")
+    return 0
+
+
+def run_train_ac(args: argparse.Namespace) -> int:
+    assert_python_310()
+    config = load_config(args.config)
+    set_seed(int(args.seed if args.seed is not None else config.get("seed", 43)))
+    device = select_device(config)
+    print(f"python: {sys.version.split()[0]}")
+    print(f"torch: {torch.__version__}")
+    print(f"device: {device}")
+
+    encoder = build_encoder(config, args.require_official_vjepa, device)
+    encoder.eval()
+    for param in encoder.parameters():
+        param.requires_grad_(False)
+
+    predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).train()
+    train_loader = DataLoader(
+        HDF5WindowDataset(args.dataset, "train"),
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=0,
+        pin_memory=device.type == "cuda",
+    )
+    val_loader = DataLoader(
+        HDF5WindowDataset(args.dataset, "val"),
+        batch_size=int(args.batch_size),
+        shuffle=False,
+        num_workers=0,
+        pin_memory=device.type == "cuda",
+    )
+
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = output_dir / "latest.pt"
+    metrics_path = output_dir / "metrics.csv"
+    optimizer = torch.optim.AdamW(predictor.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    use_amp = bool(args.amp) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    history: list[dict[str, float]] = []
+
+    with metrics_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["epoch", "train_loss", "train_loss_tf", "train_loss_roll", "val_loss", "val_loss_tf", "val_loss_roll"],
+        )
+        writer.writeheader()
+
+        for epoch in range(1, int(args.epochs) + 1):
+            start = time.time()
+            train_metrics = _run_ac_epoch(
+                encoder=encoder,
+                predictor=predictor,
+                loader=train_loader,
+                device=device,
+                rollout_steps=int(args.rollout_steps),
+                optimizer=optimizer,
+                scaler=scaler,
+                grad_accum=int(args.grad_accum),
+                use_amp=use_amp,
+            )
+            val_metrics = _evaluate_ac_loss(
+                encoder=encoder,
+                predictor=predictor,
+                loader=val_loader,
+                device=device,
+                rollout_steps=int(args.rollout_steps),
+                use_amp=use_amp,
+            )
+            row = {
+                "epoch": float(epoch),
+                "train_loss": train_metrics["loss_total"],
+                "train_loss_tf": train_metrics["loss_tf"],
+                "train_loss_roll": train_metrics["loss_roll"],
+                "val_loss": val_metrics["loss_total"],
+                "val_loss_tf": val_metrics["loss_tf"],
+                "val_loss_roll": val_metrics["loss_roll"],
+            }
+            history.append(row)
+            writer.writerow(row)
+            handle.flush()
+            torch.save(
+                {
+                    "predictor": predictor.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "config": {
+                        "predictor": config["predictor"],
+                        "train_ac": {
+                            "dataset": str(Path(args.dataset).resolve()),
+                            "epochs": int(args.epochs),
+                            "batch_size": int(args.batch_size),
+                            "grad_accum": int(args.grad_accum),
+                            "lr": float(args.lr),
+                            "weight_decay": float(args.weight_decay),
+                            "rollout_steps": int(args.rollout_steps),
+                            "amp": bool(args.amp),
+                        },
+                    },
+                    "metrics": history,
+                },
+                latest_path,
+            )
+            print(
+                f"epoch={epoch:03d} train={row['train_loss']:.6f} val={row['val_loss']:.6f} "
+                f"time={time.time() - start:.1f}s"
+            )
+
+    print(f"checkpoint: {latest_path}")
+    print("train-ac: ok")
+    return 0
+
+
+def run_eval_ac(args: argparse.Namespace) -> int:
+    assert_python_310()
+    config = load_config(args.config)
+    set_seed(int(args.seed if args.seed is not None else config.get("seed", 43)))
+    device = select_device(config)
+    print(f"python: {sys.version.split()[0]}")
+    print(f"torch: {torch.__version__}")
+    print(f"device: {device}")
+
+    encoder = build_encoder(config, args.require_official_vjepa, device)
+    predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).eval()
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    predictor.load_state_dict(checkpoint["predictor"])
+    print(f"loaded predictor checkpoint: {Path(args.checkpoint).resolve()} epoch={checkpoint.get('epoch', 'unknown')}")
+    del checkpoint
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    output_dir = Path(args.output_dir).resolve()
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    demo_cfg = dict(config.get("oracle_demo", {}))
+    planner_cfg_data = dict(config["planner"])
+    planner_cfg_data.update(
+        {
+            "horizon": int(args.horizon or planner_cfg_data["horizon"]),
+            "n_candidates": int(args.candidates or planner_cfg_data["n_candidates"]),
+            "n_elites": int(args.elites or planner_cfg_data["n_elites"]),
+            "n_iters": int(args.iters or planner_cfg_data["n_iters"]),
+            "topk_physics": int(args.topk_visualize),
+            "chunk_size": int(args.chunk_size or min(int(planner_cfg_data.get("chunk_size", 16)), 4)),
+        }
+    )
+    planner = LatentCEMPlanner(
+        predictor=predictor,
+        encoder=encoder,
+        config=cem_config_from_dict(planner_cfg_data),
+        device=device,
+    )
+    action_repeat = int(args.action_repeat or demo_cfg.get("action_repeat", 5))
+    video_fps = int(args.video_fps or demo_cfg.get("video_fps", 12))
+    env = make_smoke_env(config["environment"])
+    env.reset()
+    initial_x = env.get_agent_x()
+    initial_y = env.get_agent_y()
+    initial_reward = env.compute_reward()
+    initial_distance = env.distance_to_goal()
+    goal_z, target_frame, target_summary = build_goal_latent(env, encoder, device, int(args.target_steps or demo_cfg.get("target_steps", 80)))
+
+    metrics: list[dict[str, float]] = []
+    execution_frames = [env.render().copy()]
+    macro_context_frames = [execution_frames[0].copy(), execution_frames[0].copy()]
+    candidate_grid_rollouts: list[list[np.ndarray]] | None = None
+    for step_idx in range(int(args.mpc_steps or demo_cfg.get("mpc_steps", 20))):
+        before_plan = env.snapshot_signature()
+        with torch.no_grad():
+            z_ctx = encoder(frames_to_tensor(macro_context_frames, device))
+            state0 = torch.from_numpy(env.get_state_vector()).to(device) if args.condition_on_state else torch.zeros(7, device=device)
+            top_actions, latent_costs = planner.plan(z_ctx, goal_z, state0)
+            random_baseline = _random_latent_baseline(planner, z_ctx, goal_z, state0, planner.config.horizon)
+        if env.snapshot_signature() != before_plan:
+            raise RuntimeError("AC planning changed the live environment state.")
+        top_sequences = top_actions.detach().cpu().numpy()
+        if candidate_grid_rollouts is None:
+            candidate_grid_rollouts = collect_candidate_rollouts(env, top_sequences, action_repeat)
+        action = top_sequences[0, 0]
+        reward = env.compute_reward()
+        done = False
+        frame, reward, done, _ = env.step_macro(action, action_repeat)
+        execution_frames.append(frame.copy())
+        macro_context_frames = [macro_context_frames[-1], frame.copy()]
+        with torch.no_grad():
+            current_z = encoder(env.get_frame_tensor(str(device)))[:, -1]
+            actual_latent_cost = float(mean_patch_cost(current_z, goal_z.to(device)).item())
+        row = {
+            "step": float(step_idx),
+            "chosen_action0": float(action[0]),
+            "chosen_action1": float(action[1]),
+            "x": env.get_agent_x(),
+            "y": env.get_agent_y(),
+            "reward": float(reward),
+            "distance_to_goal": env.distance_to_goal(),
+            "latent_cost": actual_latent_cost,
+            "planned_terminal_cost": float(latent_costs[0].detach().cpu()),
+            "random_baseline_cost": random_baseline,
+        }
+        metrics.append(row)
+        print(
+            f"step={step_idx:02d} action=({row['chosen_action0']:+.3f},{row['chosen_action1']:+.3f}) "
+            f"xy=({row['x']:.4f},{row['y']:.4f}) reward={row['reward']:.4f} "
+            f"latent_cost={actual_latent_cost:.6f} planned={row['planned_terminal_cost']:.6f} "
+            f"random={random_baseline:.6f}"
+        )
+        if done:
+            break
+
+    if env.stack_depth != 0:
+        raise RuntimeError("AC eval leaked rollback stack state.")
+    final_x = env.get_agent_x()
+    final_y = env.get_agent_y()
+    final_reward = env.compute_reward()
+    final_distance = env.distance_to_goal()
+    success = final_distance < initial_distance
+    imageio.mimsave(output_dir / "execution.mp4", execution_frames, fps=video_fps, codec="libx264", macro_block_size=16)
+    if candidate_grid_rollouts:
+        imageio.mimsave(
+            output_dir / "candidate_grid.mp4",
+            make_candidate_grid_frames(candidate_grid_rollouts),
+            fps=video_fps,
+            codec="libx264",
+            macro_block_size=16,
+        )
+    else:
+        imageio.mimsave(output_dir / "candidate_grid.mp4", [target_frame], fps=video_fps, codec="libx264", macro_block_size=16)
+    write_metrics_csv(output_dir / "metrics.csv", metrics)
+    write_summary_html(
+        output_dir / "summary.html",
+        metrics=metrics,
+        initial_x=initial_x,
+        initial_reward=initial_reward,
+        final_x=final_x,
+        final_reward=final_reward,
+        goal_x=env.goal_x,
+        target_summary=target_summary,
+    )
+    print(f"initial: x={initial_x:.4f}, y={initial_y:.4f}, reward={initial_reward:.4f}")
+    print(f"final: x={final_x:.4f}, y={final_y:.4f}, reward={final_reward:.4f}")
+    print(f"outputs: {output_dir}")
+    print(f"eval-ac: {'ok' if success else 'completed-without-success'}")
+    return 0
+
+
+def _collect_synthetic_split(
+    h5: h5py.File,
+    split: str,
+    windows: int,
+    env,
+    planner: OracleCEMPlanner,
+    encoder,
+    device: torch.device,
+    rng: np.random.Generator,
+    sequence_len: int,
+    action_repeat: int,
+    target_steps: int,
+) -> None:
+    group = h5.create_group(split)
+    frames_ds = group.create_dataset(
+        "frames",
+        shape=(windows, sequence_len + 1, 384, 384, 3),
+        dtype=np.uint8,
+        chunks=(1, sequence_len + 1, 384, 384, 3),
+        compression="lzf",
+    )
+    actions_ds = group.create_dataset("actions", shape=(windows, sequence_len, 7), dtype=np.float32)
+    states_ds = group.create_dataset("states", shape=(windows, sequence_len, 7), dtype=np.float32)
+    sources = _make_source_schedule(windows, rng)
+
+    for idx in range(windows):
+        env.reset()
+        env.set_agent_xy(_sample_start_xy(rng))
+        source = sources[idx]
+        if source == "oracle":
+            goal_z, _, _ = build_goal_latent(env, encoder, device, target_steps)
+            before = env.snapshot_signature()
+            result = planner.plan(env, goal_z)
+            if env.snapshot_signature() != before:
+                raise RuntimeError("Oracle synthetic planning changed the live environment state.")
+            actions = result.best_sequence[:sequence_len]
+        else:
+            actions = _scripted_actions(env, rng, sequence_len, source)
+        frames, states, _, summary = _record_macro_window(env, actions, action_repeat)
+        if env.stack_depth != 0:
+            raise RuntimeError("Synthetic data collection leaked rollback stack state.")
+        frames_ds[idx] = frames
+        actions_ds[idx] = actions.astype(np.float32)
+        states_ds[idx] = states.astype(np.float32)
+        if (idx + 1) % max(1, min(100, windows)) == 0 or idx == windows - 1:
+            print(
+                f"{split}: {idx + 1}/{windows} source={source} "
+                f"xy=({summary['x']:.3f},{summary['y']:.3f}) reward={summary['reward']:.3f}"
+            )
+
+    group.attrs["sources"] = ",".join(sources)
+
+
+def _collect_latent_split(
+    split: str,
+    windows: int,
+    out_dir: Path,
+    env,
+    planner: OracleCEMPlanner,
+    encoder,
+    device: torch.device,
+    rng: np.random.Generator,
+    sequence_len: int,
+    action_repeat: int,
+    target_steps: int,
+    shard_size: int,
+    encode_batch_size: int,
+    amp: bool,
+    resume: bool,
+    seed: int,
+    oracle_cfg,
+) -> None:
+    sources = _make_source_schedule(windows, rng)
+    total_shards = math.ceil(windows / shard_size)
+    for shard_idx in range(total_shards):
+        start = shard_idx * shard_size
+        stop = min(windows, start + shard_size)
+        final_path = out_dir / f"{split}-{shard_idx:05d}.h5"
+        if resume and _latent_shard_complete(final_path):
+            print(f"{split}: skip completed shard {shard_idx + 1}/{total_shards}")
+            continue
+        tmp_path = out_dir / f"{split}-{shard_idx:05d}.tmp.h5"
+        if tmp_path.exists():
+            tmp_path.unlink()
+        count = stop - start
+        frames = np.zeros((count, sequence_len + 1, 384, 384, 3), dtype=np.uint8)
+        actions = np.zeros((count, sequence_len, 7), dtype=np.float32)
+        states = np.zeros((count, sequence_len, 7), dtype=np.float32)
+        next_states = np.zeros((count, sequence_len, 7), dtype=np.float32)
+        shard_sources = sources[start:stop]
+        for local_idx, source in enumerate(shard_sources):
+            env.reset()
+            env.set_agent_xy(_sample_start_xy(rng))
+            if source == "oracle":
+                goal_z, _, _ = build_goal_latent(env, encoder, device, target_steps)
+                before = env.snapshot_signature()
+                result = planner.plan(env, goal_z)
+                if env.snapshot_signature() != before:
+                    raise RuntimeError("Oracle latent-shard planning changed the live environment state.")
+                action_window = result.best_sequence[:sequence_len]
+            else:
+                action_window = _scripted_actions(env, rng, sequence_len, source)
+            frame_window, state_window, next_state_window, _ = _record_macro_window(env, action_window, action_repeat)
+            frames[local_idx] = frame_window
+            actions[local_idx] = action_window.astype(np.float32)
+            states[local_idx] = state_window.astype(np.float32)
+            next_states[local_idx] = next_state_window.astype(np.float32)
+            if env.stack_depth != 0:
+                raise RuntimeError("Latent shard collection leaked rollback stack state.")
+
+        z = _encode_frame_windows(
+            encoder=encoder,
+            frames=frames,
+            device=device,
+            batch_size=encode_batch_size,
+            use_amp=amp and device.type == "cuda",
+        )
+        with h5py.File(tmp_path, "w") as h5:
+            h5.create_dataset("z", data=z, dtype=np.float16, chunks=(1, sequence_len + 1, 576, 768), compression="lzf")
+            h5.create_dataset("actions", data=actions, dtype=np.float32)
+            h5.create_dataset("states", data=states, dtype=np.float32)
+            h5.create_dataset("next_states", data=next_states, dtype=np.float32)
+            h5.attrs["complete"] = 1
+            h5.attrs["split"] = split
+            h5.attrs["seed"] = seed
+            h5.attrs["sequence_len"] = sequence_len
+            h5.attrs["action_repeat"] = action_repeat
+            h5.attrs["sources"] = ",".join(shard_sources)
+            h5.attrs["oracle_config"] = repr(oracle_cfg)
+        os.replace(tmp_path, final_path)
+        del frames, actions, states, next_states, z
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        print(f"{split}: shard {shard_idx + 1}/{total_shards} windows={count} path={final_path.name}")
+    (out_dir / f"{split}.DONE").write_text(str(windows), encoding="utf-8")
+
+
+@torch.no_grad()
+def _encode_frame_windows(
+    encoder,
+    frames: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+    use_amp: bool,
+) -> np.ndarray:
+    outputs: list[np.ndarray] = []
+    for start in range(0, frames.shape[0], batch_size):
+        batch_np = frames[start : start + batch_size].astype(np.float32) / 255.0
+        batch = torch.from_numpy(batch_np).permute(0, 1, 4, 2, 3).to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            z = encoder(batch)
+        outputs.append(z.detach().to(dtype=torch.float16, device="cpu").numpy())
+        del batch, z
+    return np.concatenate(outputs, axis=0)
+
+
+def _latent_shard_complete(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with h5py.File(path, "r") as h5:
+            return bool(h5.attrs.get("complete", 0)) and "z" in h5 and "actions" in h5 and "states" in h5
+    except OSError:
+        return False
+
+
+def _list_complete_latent_shards(data_dir: Path, split: str) -> list[Path]:
+    return [path for path in sorted(data_dir.glob(f"{split}-*.h5")) if _latent_shard_complete(path)]
+
+
+def _train_latent_shard(
+    predictor: ActionConditionedPredictor,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    shard: Path,
+    device: torch.device,
+    batch_size: int,
+    grad_accum: int,
+    rollout_steps: int,
+    use_amp: bool,
+    rng: np.random.Generator,
+    condition_on_state: bool,
+) -> dict[str, float]:
+    predictor.train()
+    totals = {
+        "loss_tf": 0.0,
+        "loss_roll": 0.0,
+        "loss_delta": 0.0,
+        "loss_delta_roll": 0.0,
+        "loss_action_contrast": 0.0,
+        "loss_total": 0.0,
+    }
+    count = 0
+    optimizer.zero_grad(set_to_none=True)
+    with h5py.File(shard, "r") as h5:
+        n_items = int(h5["z"].shape[0])
+        order = np.arange(n_items)
+        rng.shuffle(order)
+        step = 0
+        for start in range(0, n_items, batch_size):
+            idx = np.sort(order[start : start + batch_size])
+            z = torch.from_numpy(h5["z"][idx].astype(np.float32)).to(device, non_blocking=True)
+            actions = torch.from_numpy(h5["actions"][idx].astype(np.float32)).to(device, non_blocking=True)
+            if condition_on_state:
+                states = torch.from_numpy(h5["states"][idx].astype(np.float32)).to(device, non_blocking=True)
+            else:
+                states = torch.zeros_like(actions)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                loss, metrics = compute_ac_predictor_latent_loss(
+                    predictor,
+                    z,
+                    actions,
+                    states,
+                    rollout_steps=rollout_steps,
+                )
+                scaled_loss = loss / max(1, grad_accum)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite latent training loss in {shard}: {metrics}")
+            scaler.scale(scaled_loss).backward()
+            step += 1
+            if step % max(1, grad_accum) == 0 or start + batch_size >= n_items:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            for key in totals:
+                totals[key] += metrics[key]
+            count += 1
+            del z, actions, states, loss
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {key: value / max(1, count) for key, value in totals.items()}
+
+
+@torch.no_grad()
+def _evaluate_latent_shards(
+    predictor: ActionConditionedPredictor,
+    shards: list[Path],
+    device: torch.device,
+    batch_size: int,
+    rollout_steps: int,
+    use_amp: bool,
+    condition_on_state: bool,
+) -> dict[str, float]:
+    predictor.eval()
+    totals = {
+        "loss_tf": 0.0,
+        "loss_roll": 0.0,
+        "loss_delta": 0.0,
+        "loss_delta_roll": 0.0,
+        "loss_action_contrast": 0.0,
+        "loss_total": 0.0,
+    }
+    count = 0
+    for shard in shards:
+        with h5py.File(shard, "r") as h5:
+            n_items = int(h5["z"].shape[0])
+            for start in range(0, n_items, batch_size):
+                slc = slice(start, min(n_items, start + batch_size))
+                z = torch.from_numpy(h5["z"][slc].astype(np.float32)).to(device, non_blocking=True)
+                actions = torch.from_numpy(h5["actions"][slc].astype(np.float32)).to(device, non_blocking=True)
+                if condition_on_state:
+                    states = torch.from_numpy(h5["states"][slc].astype(np.float32)).to(device, non_blocking=True)
+                else:
+                    states = torch.zeros_like(actions)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                    loss, metrics = compute_ac_predictor_latent_loss(
+                        predictor,
+                        z,
+                        actions,
+                        states,
+                        rollout_steps=rollout_steps,
+                    )
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f"Non-finite latent validation loss in {shard}: {metrics}")
+                for key in totals:
+                    totals[key] += metrics[key]
+                count += 1
+                del z, actions, states, loss
+    return {key: value / max(1, count) for key, value in totals.items()}
+
+
+def _save_latent_checkpoint(
+    path: Path,
+    predictor: ActionConditionedPredictor,
+    optimizer: torch.optim.Optimizer,
+    config: dict,
+    args: argparse.Namespace,
+    history: list[dict[str, float]],
+) -> None:
+    torch.save(
+        {
+            "predictor": predictor.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "config": {
+                "predictor": config["predictor"],
+                "train_ac_latent": _serializable_args(args),
+            },
+            "metrics": history,
+        },
+        path,
+    )
+
+
+def _serializable_args(args: argparse.Namespace) -> dict:
+    data = {}
+    for key, value in vars(args).items():
+        if key == "func" or callable(value):
+            continue
+        if isinstance(value, Path):
+            data[key] = str(value)
+        elif isinstance(value, (str, int, float, bool, type(None))):
+            data[key] = value
+        else:
+            data[key] = repr(value)
+    return data
+
+
+def _make_source_schedule(windows: int, rng: np.random.Generator) -> list[str]:
+    oracle_count = int(round(windows * 0.60))
+    directional_count = int(round(windows * 0.25))
+    random_count = max(0, windows - oracle_count - directional_count)
+    sources = ["oracle"] * oracle_count + ["directional"] * directional_count + ["random"] * random_count
+    rng.shuffle(sources)
+    return sources
+
+
+def _sample_start_xy(rng: np.random.Generator) -> np.ndarray:
+    for _ in range(100):
+        xy = np.array([rng.uniform(-0.85, 0.55), rng.uniform(-0.85, 0.55)], dtype=np.float32)
+        if not (abs(float(xy[0])) < 0.14 and abs(float(xy[1])) < 0.55):
+            return xy
+    return np.array([-0.75, -0.55], dtype=np.float32)
+
+
+def _scripted_actions(env, rng: np.random.Generator, sequence_len: int, source: str) -> np.ndarray:
+    actions = np.zeros((sequence_len, 7), dtype=np.float32)
+    for step in range(sequence_len):
+        if source == "directional":
+            if env.get_agent_x() < 0.25:
+                xy = np.array([1.0, 0.15], dtype=np.float32)
+            else:
+                xy = np.array([0.0, 1.0], dtype=np.float32)
+            xy += rng.normal(0.0, 0.15, size=2).astype(np.float32)
+        elif source == "random":
+            xy = rng.uniform(-1.0, 1.0, size=2).astype(np.float32)
+            if rng.random() < 0.35:
+                xy += 0.4 * (env.goal_xy - env.get_agent_xy())
+        else:
+            raise ValueError(f"Unknown synthetic source: {source}")
+        actions[step, :2] = np.clip(xy, -1.0, 1.0)
+    return actions
+
+
+def _record_macro_window(env, actions: np.ndarray, action_repeat: int) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    sequence_len = int(actions.shape[0])
+    frames = np.zeros((sequence_len + 1, 384, 384, 3), dtype=np.uint8)
+    states = np.zeros((sequence_len, 7), dtype=np.float32)
+    next_states = np.zeros((sequence_len, 7), dtype=np.float32)
+    frames[0] = env.render().copy()
+    reward = env.compute_reward()
+    done = False
+    for step, action in enumerate(actions.astype(np.float32)):
+        states[step] = env.get_state_vector()
+        frame, reward, done, _ = env.step_macro(action, action_repeat)
+        next_states[step] = env.get_state_vector()
+        frames[step + 1] = frame.copy()
+    summary = {
+        "x": env.get_agent_x(),
+        "y": env.get_agent_y(),
+        "reward": float(reward),
+        "done": float(done),
+        "distance_to_goal": env.distance_to_goal(),
+    }
+    return frames, states, next_states, summary
+
+
+def _move_batch_to_device(batch: dict[str, torch.Tensor], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    frames = batch["frames"].to(device, non_blocking=True)
+    actions = batch["actions"].to(device, non_blocking=True)
+    states = batch["states"].to(device, non_blocking=True)
+    return frames, actions, states
+
+
+def _run_ac_epoch(
+    encoder,
+    predictor: ActionConditionedPredictor,
+    loader: DataLoader,
+    device: torch.device,
+    rollout_steps: int,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    grad_accum: int,
+    use_amp: bool,
+) -> dict[str, float]:
+    predictor.train()
+    optimizer.zero_grad(set_to_none=True)
+    totals = {"loss_tf": 0.0, "loss_roll": 0.0, "loss_total": 0.0}
+    count = 0
+    for step, batch in enumerate(loader, start=1):
+        frames, actions, states = _move_batch_to_device(batch, device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            loss, metrics = compute_ac_predictor_loss(encoder, predictor, frames, actions, states, rollout_steps=rollout_steps)
+            scaled_loss = loss / max(1, grad_accum)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite AC training loss: {metrics}")
+        scaler.scale(scaled_loss).backward()
+        if step % max(1, grad_accum) == 0 or step == len(loader):
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        for key in totals:
+            totals[key] += metrics[key]
+        count += 1
+    return {key: value / max(1, count) for key, value in totals.items()}
+
+
+@torch.no_grad()
+def _evaluate_ac_loss(
+    encoder,
+    predictor: ActionConditionedPredictor,
+    loader: DataLoader,
+    device: torch.device,
+    rollout_steps: int,
+    use_amp: bool,
+) -> dict[str, float]:
+    predictor.eval()
+    totals = {"loss_tf": 0.0, "loss_roll": 0.0, "loss_total": 0.0}
+    count = 0
+    for batch in loader:
+        frames, actions, states = _move_batch_to_device(batch, device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            loss, metrics = compute_ac_predictor_loss(encoder, predictor, frames, actions, states, rollout_steps=rollout_steps)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Non-finite AC validation loss: {metrics}")
+        for key in totals:
+            totals[key] += metrics[key]
+        count += 1
+    return {key: value / max(1, count) for key, value in totals.items()}
+
+
+@torch.no_grad()
+def _random_latent_baseline(
+    planner: LatentCEMPlanner,
+    z_ctx: torch.Tensor,
+    goal_z: torch.Tensor,
+    state0: torch.Tensor,
+    horizon: int,
+) -> float:
+    actions = torch.empty(32, horizon, 7, device=planner.device).uniform_(-1.0, 1.0)
+    costs = planner.evaluate_sequences(z_ctx, goal_z, actions, state0)
+    return float(costs.min().detach().cpu())
+
+
 @torch.no_grad()
 def build_goal_latent(env, encoder, device: torch.device, target_steps: int) -> tuple[torch.Tensor, np.ndarray, dict]:
     env.push_state()
@@ -552,6 +1711,109 @@ def build_parser() -> argparse.ArgumentParser:
     oracle.add_argument("--output-dir")
     oracle.add_argument("--execute-full-plan", action="store_true")
     oracle.set_defaults(func=run_oracle_demo)
+    collect = sub.add_parser("collect-synthetic", help="Collect synthetic HDF5 windows for V-JEPA2-AC training.")
+    collect.add_argument("--config", default="configs.yaml")
+    collect.add_argument("--require-official-vjepa", action="store_true")
+    collect.add_argument("--output", default="data/synthetic_ac_medium.h5")
+    collect.add_argument("--train-windows", type=int, default=5000)
+    collect.add_argument("--val-windows", type=int, default=500)
+    collect.add_argument("--sequence-len", type=int, default=2)
+    collect.add_argument("--action-repeat", type=int, default=5)
+    collect.add_argument("--target-steps", type=int, default=80)
+    collect.add_argument("--oracle-horizon", type=int)
+    collect.add_argument("--oracle-candidates", type=int)
+    collect.add_argument("--oracle-elites", type=int)
+    collect.add_argument("--oracle-iters", type=int)
+    collect.add_argument("--encode-batch-size", type=int)
+    collect.add_argument("--seed", type=int)
+    collect.set_defaults(func=run_collect_synthetic)
+    collect_latent = sub.add_parser("collect-latent-shards", help="Collect atomic latent shards for V-JEPA2-AC training.")
+    collect_latent.add_argument("--config", default="configs.yaml")
+    collect_latent.add_argument("--require-official-vjepa", action="store_true")
+    collect_latent.add_argument("--output-dir", default="data/ac_latent_shards")
+    collect_latent.add_argument("--train-windows", type=int, default=5000)
+    collect_latent.add_argument("--val-windows", type=int, default=500)
+    collect_latent.add_argument("--sequence-len", type=int, default=2)
+    collect_latent.add_argument("--action-repeat", type=int, default=5)
+    collect_latent.add_argument("--target-steps", type=int, default=80)
+    collect_latent.add_argument("--shard-size", type=int, default=64)
+    collect_latent.add_argument("--oracle-horizon", type=int)
+    collect_latent.add_argument("--oracle-candidates", type=int, default=8)
+    collect_latent.add_argument("--oracle-elites", type=int, default=2)
+    collect_latent.add_argument("--oracle-iters", type=int, default=1)
+    collect_latent.add_argument("--encode-batch-size", type=int, default=16)
+    collect_latent.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    collect_latent.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    collect_latent.add_argument("--seed", type=int)
+    collect_latent.set_defaults(func=run_collect_latent_shards)
+    train_latent = sub.add_parser("train-ac-latent", help="Train the AC predictor from cached latent shards.")
+    train_latent.add_argument("--config", default="configs.yaml")
+    train_latent.add_argument("--data-dir", default="data/ac_latent_shards")
+    train_latent.add_argument("--output-dir", default="runs/ac_train")
+    train_latent.add_argument("--epochs", type=int, default=10)
+    train_latent.add_argument("--batch-size", type=int, default=1)
+    train_latent.add_argument("--grad-accum", type=int, default=8)
+    train_latent.add_argument("--lr", type=float, default=1e-4)
+    train_latent.add_argument("--weight-decay", type=float, default=0.04)
+    train_latent.add_argument("--rollout-steps", type=int, default=2)
+    train_latent.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    train_latent.add_argument("--watch", action="store_true")
+    train_latent.add_argument("--expected-train-shards", type=int)
+    train_latent.add_argument("--expected-val-shards", type=int)
+    train_latent.add_argument("--poll-seconds", type=float, default=5.0)
+    train_latent.add_argument("--replay-while-waiting", action="store_true")
+    train_latent.add_argument("--condition-on-state", action=argparse.BooleanOptionalAction, default=False)
+    train_latent.add_argument("--resume-checkpoint")
+    train_latent.add_argument("--seed", type=int)
+    train_latent.set_defaults(func=run_train_ac_latent)
+    pipe_latent = sub.add_parser("pipeline-latent", help="Run latent shard collection and training concurrently.")
+    pipe_latent.add_argument("--run-dir", default="runs/latent_pipeline")
+    pipe_latent.add_argument("--data-dir", default="data/ac_latent_shards")
+    pipe_latent.add_argument("--output-dir", default="runs/ac_train")
+    pipe_latent.add_argument("--train-windows", type=int, default=5000)
+    pipe_latent.add_argument("--val-windows", type=int, default=500)
+    pipe_latent.add_argument("--shard-size", type=int, default=64)
+    pipe_latent.add_argument("--oracle-candidates", type=int, default=8)
+    pipe_latent.add_argument("--oracle-elites", type=int, default=2)
+    pipe_latent.add_argument("--oracle-iters", type=int, default=1)
+    pipe_latent.add_argument("--encode-batch-size", type=int, default=16)
+    pipe_latent.add_argument("--final-epochs", type=int, default=4)
+    pipe_latent.add_argument("--batch-size", type=int, default=1)
+    pipe_latent.add_argument("--grad-accum", type=int, default=8)
+    pipe_latent.add_argument("--condition-on-state", action=argparse.BooleanOptionalAction, default=False)
+    pipe_latent.set_defaults(func=run_pipeline_latent)
+    train_ac = sub.add_parser("train-ac", help="Train the action-conditioned latent predictor.")
+    train_ac.add_argument("--config", default="configs.yaml")
+    train_ac.add_argument("--require-official-vjepa", action="store_true")
+    train_ac.add_argument("--dataset", default="data/synthetic_ac_medium.h5")
+    train_ac.add_argument("--output-dir", default="runs/ac_train")
+    train_ac.add_argument("--epochs", type=int, default=10)
+    train_ac.add_argument("--batch-size", type=int, default=1)
+    train_ac.add_argument("--grad-accum", type=int, default=8)
+    train_ac.add_argument("--lr", type=float, default=1e-4)
+    train_ac.add_argument("--weight-decay", type=float, default=0.04)
+    train_ac.add_argument("--rollout-steps", type=int, default=2)
+    train_ac.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    train_ac.add_argument("--seed", type=int)
+    train_ac.set_defaults(func=run_train_ac)
+    eval_ac = sub.add_parser("eval-ac", help="Evaluate a trained action-conditioned predictor with latent CEM.")
+    eval_ac.add_argument("--config", default="configs.yaml")
+    eval_ac.add_argument("--require-official-vjepa", action="store_true")
+    eval_ac.add_argument("--checkpoint", default="runs/ac_train/latest.pt")
+    eval_ac.add_argument("--output-dir", default="runs/ac_eval/latest")
+    eval_ac.add_argument("--mpc-steps", type=int)
+    eval_ac.add_argument("--horizon", type=int)
+    eval_ac.add_argument("--candidates", type=int)
+    eval_ac.add_argument("--elites", type=int)
+    eval_ac.add_argument("--iters", type=int)
+    eval_ac.add_argument("--chunk-size", type=int)
+    eval_ac.add_argument("--action-repeat", type=int)
+    eval_ac.add_argument("--target-steps", type=int)
+    eval_ac.add_argument("--topk-visualize", type=int, default=4)
+    eval_ac.add_argument("--video-fps", type=int)
+    eval_ac.add_argument("--seed", type=int)
+    eval_ac.add_argument("--condition-on-state", action=argparse.BooleanOptionalAction, default=False)
+    eval_ac.set_defaults(func=run_eval_ac)
     return parser
 
 

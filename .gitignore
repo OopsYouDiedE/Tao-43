@@ -15,6 +15,10 @@ dist/
 
 data/*.h5
 data/*.hdf5
+data/**/*.h5
+data/**/*.tmp.h5
+/data/
+/runs/
 checkpoints/
 *.pt
 *.pth

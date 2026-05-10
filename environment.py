@@ -121,6 +121,16 @@ class RollbackMuJoCoEnv:
         done = reward >= 0.95
         return frame, reward, done, {"state_vector": self.get_state_vector()}
 
+    def step_macro(self, action: np.ndarray, repeats: int) -> tuple[np.ndarray, float, bool, dict]:
+        reward = self.compute_reward()
+        done = False
+        frame = self.render()
+        for _ in range(max(1, repeats)):
+            frame, reward, done, info = self.step(action)
+            if done:
+                break
+        return frame, reward, done, info
+
     def render(self) -> np.ndarray:
         return self.physics.render(
             height=self.render_height,
@@ -184,6 +194,16 @@ class RollbackMuJoCoEnv:
         if len(self.frame_buffer) != self.frame_buffer_len:
             raise RuntimeError("Frame buffer is not full; call reset() first.")
         frames = np.stack(list(self.frame_buffer), axis=0)
+        frames = frames.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(frames).unsqueeze(0)
+        return tensor.to(device) if device else tensor
+
+    def get_macro_context_tensor(self, action_repeat: int, device: str | None = None):
+        import torch
+
+        if len(self.frame_buffer) != self.frame_buffer_len:
+            raise RuntimeError("Frame buffer is not full; call reset() first.")
+        frames = np.stack([self.frame_buffer[0], self.frame_buffer[-1]], axis=0)
         frames = frames.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
         tensor = torch.from_numpy(frames).unsqueeze(0)
         return tensor.to(device) if device else tensor

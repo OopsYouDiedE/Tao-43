@@ -45,6 +45,43 @@ class HDF5EpisodeDataset(Dataset):
         }
 
 
+class HDF5WindowDataset(Dataset):
+    def __init__(self, path: str | Path, split: str = "train") -> None:
+        self.path = Path(path)
+        self.split = split
+        with h5py.File(self.path, "r") as h5:
+            if split not in h5:
+                raise ValueError(f"HDF5 dataset has no split {split!r}.")
+            group = h5[split]
+            frames = group["frames"]
+            actions = group["actions"]
+            states = group["states"]
+            if frames.ndim != 5 or frames.shape[2:] != (384, 384, 3):
+                raise ValueError(f"{split}/frames must be [N, T+1, 384, 384, 3].")
+            if actions.shape[:2] != (frames.shape[0], frames.shape[1] - 1) or actions.shape[2] != 7:
+                raise ValueError(f"{split}/actions must be [N, T, 7].")
+            if states.shape != actions.shape:
+                raise ValueError(f"{split}/states must match actions shape [N, T, 7].")
+            self.length = int(frames.shape[0])
+            self.sequence_len = int(actions.shape[1])
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> dict[str, Tensor]:
+        with h5py.File(self.path, "r") as h5:
+            group = h5[self.split]
+            frames = group["frames"][index]
+            actions = group["actions"][index]
+            states = group["states"][index]
+        frames = torch.from_numpy(frames.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
+        return {
+            "frames": frames,
+            "actions": torch.from_numpy(actions.astype(np.float32)),
+            "states": torch.from_numpy(states.astype(np.float32)),
+        }
+
+
 @dataclass(frozen=True)
 class TrainerConfig:
     rollout_steps: int = 2
@@ -90,6 +127,93 @@ def compute_ac_predictor_loss(
         "loss_roll": float(loss_roll.detach().cpu()),
         "loss_total": float(total.detach().cpu()),
     }
+
+
+def compute_ac_predictor_latent_loss(
+    predictor: ActionConditionedPredictor,
+    z: Tensor,
+    actions: Tensor,
+    states: Tensor,
+    rollout_steps: int = 2,
+    delta_loss_weight: float = 2.0,
+    focus_loss_weight: float = 4.0,
+    action_contrast_weight: float = 0.2,
+) -> tuple[Tensor, dict[str, float]]:
+    if z.ndim != 4:
+        raise ValueError(f"z must be [B, T+1, 576, 768], got {tuple(z.shape)}")
+    z_in = z[:, :-1]
+    z_target = z[:, 1:]
+    pred_tf = predictor(z_in, actions, states)
+    weights = _latent_focus_weights(z)
+    loss_tf = _weighted_smooth_l1(pred_tf, z_target, weights[:, 1:])
+    loss_delta = _weighted_smooth_l1(pred_tf - z_in, z_target - z_in, weights[:, 1:])
+
+    rollout_losses = []
+    rollout_delta_losses = []
+    z_window = z[:, :1]
+    action_window = actions[:, :1]
+    state_window = states[:, :1]
+    steps = min(rollout_steps, actions.shape[1])
+    for step in range(steps):
+        pred = predictor(z_window, action_window, state_window)
+        next_z = pred[:, -1]
+        rollout_losses.append(_weighted_smooth_l1(next_z[:, None], z[:, step + 1 : step + 2], weights[:, step + 1 : step + 2]))
+        rollout_delta_losses.append(
+            _weighted_smooth_l1(
+                (next_z - z_window[:, -1])[:, None],
+                (z[:, step + 1] - z_window[:, -1])[:, None],
+                weights[:, step + 1 : step + 2],
+            )
+        )
+        z_window = torch.cat([z_window, next_z[:, None]], dim=1)
+        if step + 1 < steps:
+            action_window = torch.cat([action_window, actions[:, step + 1 : step + 2]], dim=1)
+            state_window = torch.cat([state_window, states[:, step + 1 : step + 2]], dim=1)
+    loss_roll = torch.stack(rollout_losses).mean() if rollout_losses else torch.zeros_like(loss_tf)
+    loss_delta_roll = torch.stack(rollout_delta_losses).mean() if rollout_delta_losses else torch.zeros_like(loss_tf)
+    loss_action_contrast = _action_contrastive_loss(predictor, z_in, actions, states, pred_tf.detach(), weights[:, 1:])
+    total = loss_tf + 0.5 * loss_roll + delta_loss_weight * (loss_delta + 0.5 * loss_delta_roll) + action_contrast_weight * loss_action_contrast
+    return total, {
+        "loss_tf": float(loss_tf.detach().cpu()),
+        "loss_roll": float(loss_roll.detach().cpu()),
+        "loss_delta": float(loss_delta.detach().cpu()),
+        "loss_delta_roll": float(loss_delta_roll.detach().cpu()),
+        "loss_action_contrast": float(loss_action_contrast.detach().cpu()),
+        "loss_total": float(total.detach().cpu()),
+    }
+
+
+def _latent_focus_weights(z: Tensor) -> Tensor:
+    diff = (z[:, 1:] - z[:, :-1]).square().mean(dim=-1)
+    first = diff[:, :1]
+    scores = torch.cat([first, diff], dim=1)
+    scores = scores / (scores.mean(dim=-1, keepdim=True) + 1e-6)
+    return (1.0 + 4.0 * scores.clamp(max=5.0)).detach()
+
+
+def _weighted_smooth_l1(pred: Tensor, target: Tensor, weights: Tensor) -> Tensor:
+    loss = F.smooth_l1_loss(pred, target, reduction="none").mean(dim=-1)
+    return (loss * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def _action_contrastive_loss(
+    predictor: ActionConditionedPredictor,
+    z_in: Tensor,
+    actions: Tensor,
+    states: Tensor,
+    positive_pred: Tensor,
+    weights: Tensor,
+) -> Tensor:
+    if actions.shape[0] < 2:
+        return torch.zeros((), device=z_in.device, dtype=z_in.dtype)
+    perm = torch.roll(torch.arange(actions.shape[0], device=actions.device), shifts=1)
+    shuffled_actions = actions[perm]
+    if torch.allclose(shuffled_actions, actions):
+        return torch.zeros((), device=z_in.device, dtype=z_in.dtype)
+    negative_pred = predictor(z_in, shuffled_actions, states)
+    separation = ((negative_pred - positive_pred).square().mean(dim=-1) * weights).sum() / weights.sum().clamp_min(1.0)
+    positive_motion = ((positive_pred - z_in).square().mean(dim=-1) * weights).sum() / weights.sum().clamp_min(1.0)
+    return F.relu(0.05 * positive_motion.detach() - separation)
 
 
 class EMAEncoder(nn.Module):

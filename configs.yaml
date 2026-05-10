@@ -1,0 +1,71 @@
+seed: 43
+
+device:
+  prefer_cuda: true
+
+vjepa:
+  hub_repo: facebookresearch/vjepa2
+  model_name: vjepa2_1_vit_base_384
+  pretrained: true
+  checkpoint_base_url: https://dl.fbaipublicfiles.com/vjepa2
+  image_size: 384
+  patch_size: 16
+  patches_per_frame: 576
+  embed_dim: 768
+  require_official: true
+
+predictor:
+  visual_dim: 768
+  pred_dim: 768
+  action_dim: 7
+  state_dim: 7
+  num_layers: 12
+  num_heads: 12
+  dropout: 0.0
+
+environment:
+  frame_buffer_len: 2
+  render_width: 384
+  render_height: 384
+  camera_id: fixed
+
+planner:
+  horizon: 15
+  n_candidates: 512
+  n_elites: 64
+  n_iters: 10
+  topk_physics: 5
+  action_low: -1.0
+  action_high: 1.0
+  initial_std: 0.6
+  min_std: 0.05
+  chunk_size: 16
+
+trainer:
+  rollout_steps: 2
+  ema_tau: 0.996
+  mask_ratio: 0.75
+  unfreeze_last_blocks: 2
+
+verify:
+  planner_horizon: 1
+  planner_candidates: 1
+  planner_elites: 1
+  planner_iters: 1
+  planner_topk_physics: 1
+
+oracle_demo:
+  mpc_steps: 20
+  horizon: 8
+  n_candidates: 32
+  n_elites: 8
+  n_iters: 3
+  action_dims: 2
+  action_repeat: 5
+  distance_cost_weight: 0.0
+  use_action_priors: false
+  target_steps: 80
+  encode_batch_size: 4
+  topk_visualize: 4
+  video_fps: 12
+  output_dir: runs/oracle_demo/latest

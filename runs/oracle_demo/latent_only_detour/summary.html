@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>VJEPA-Gym Oracle Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; color: #1f2933; }
+    img { max-width: 480px; margin-right: 16px; border: 1px solid #d0d7de; }
+    table { border-collapse: collapse; margin-top: 16px; }
+    th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: right; }
+    th { background: #f6f8fa; }
+    .charts { display: flex; gap: 16px; flex-wrap: wrap; margin: 16px 0; }
+  </style>
+</head>
+<body>
+  <h1>VJEPA-Gym Oracle Demo</h1>
+  <p>Initial x=-0.7500, reward=0.0000; final x=-0.4647, reward=0.3203; goal x=0.7500.</p>
+  <p>Target image x=0.8355, y=0.4792, reward=0.9403.</p>
+  <div>
+    <video src="execution.mp4" controls autoplay muted loop width="480"></video>
+    <video src="candidate_grid.mp4" controls autoplay muted loop width="480"></video>
+  </div>
+  <div class="charts"><svg width='360' height='180' viewBox='0 0 360 180'><text x='16' y='20' font-size='14'>Reward</text><polyline points='24.0,152.0 69.7,128.1 115.4,103.3 161.1,100.3 206.9,122.1 252.6,117.3 298.3,80.1 344.0,28.0' fill='none' stroke='#0969da' stroke-width='2'/><text x='16' y='172' font-size='11'>min=0.0210 max=0.3203</text></svg><svg width='360' height='180' viewBox='0 0 360 180'><text x='16' y='20' font-size='14'>Latent Cost</text><polyline points='24.0,57.4 69.7,36.4 115.4,28.0 161.1,91.5 206.9,141.1 252.6,152.0 298.3,133.4 344.0,149.8' fill='none' stroke='#0969da' stroke-width='2'/><text x='16' y='172' font-size='11'>min=0.2181 max=0.3944</text></svg></div>
+  <table>
+    <thead><tr><th>step</th><th>action0</th><th>action1</th><th>x</th><th>y</th><th>reward</th><th>latent_cost</th></tr></thead>
+    <tbody><tr><td>0</td><td>+0.145</td><td>+0.695</td><td>-0.7392</td><td>-0.4981</td><td>0.0210</td><td>0.352577</td></tr>
+<tr><td>1</td><td>+0.215</td><td>+0.689</td><td>-0.7043</td><td>-0.3563</td><td>0.0788</td><td>0.382538</td></tr>
+<tr><td>2</td><td>-0.370</td><td>+0.285</td><td>-0.6863</td><td>-0.1602</td><td>0.1386</td><td>0.394436</td></tr>
+<tr><td>3</td><td>-1.000</td><td>+0.436</td><td>-0.7662</td><td>0.0739</td><td>0.1457</td><td>0.304085</td></tr>
+<tr><td>4</td><td>-0.379</td><td>+1.000</td><td>-0.9295</td><td>0.3950</td><td>0.0933</td><td>0.233642</td></tr>
+<tr><td>5</td><td>+0.187</td><td>+0.330</td><td>-0.9128</td><td>0.6384</td><td>0.1048</td><td>0.218130</td></tr>
+<tr><td>6</td><td>+0.568</td><td>+0.051</td><td>-0.7276</td><td>0.7984</td><td>0.1945</td><td>0.244615</td></tr>
+<tr><td>7</td><td>+0.732</td><td>-0.389</td><td>-0.4647</td><td>0.9010</td><td>0.3203</td><td>0.221239</td></tr></tbody>
+  </table>
+</body>
+</html>

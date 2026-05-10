@@ -16,6 +16,8 @@ dist/
 data/*.h5
 data/*.hdf5
 checkpoints/
+*.pt
+*.pth
 
 .env
 .env.*

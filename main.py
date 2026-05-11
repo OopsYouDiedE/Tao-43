@@ -1668,6 +1668,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipe_latent.add_argument("--oracle-candidates", type=int, default=4)     # 原8，规划速度2×
     pipe_latent.add_argument("--oracle-elites", type=int, default=1)         # 原2
     pipe_latent.add_argument("--oracle-iters", type=int, default=1)
+    pipe_latent.add_argument("--encode-batch-size", type=int, default=32)
     pipe_latent.add_argument("--sequence-len", type=int, default=4)
     pipe_latent.add_argument("--rollout-steps", type=int, default=4)
     pipe_latent.add_argument("--final-epochs", type=int, default=4)

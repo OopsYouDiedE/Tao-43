@@ -445,7 +445,7 @@ def _get_free_ram_mb() -> float:
 
 
 # 训练小批量对梯度质量的边际收益递减（过大批次可能伤收敛）
-_BATCH_SIZE_CAP:   int = 64
+_BATCH_SIZE_CAP:   int = 32
 # 超过此值 GPU 利用率提升有限
 _ENCODE_BATCH_CAP: int = 128
 # 超过此值 DataLoader worker 调度开销超过 I/O 收益
@@ -459,9 +459,9 @@ def probe_safe_memory_params(
     encode_batch_size: int = 32,
     num_workers: int = 4,
     *,
-    model_vram_mb: float = 1200.0,
-    per_sample_vram_mb: float = 150.0,
-    vram_headroom_mb: float = 512.0,
+    model_vram_mb: float = 2048.0,      # V-JEPA + Predictor 模型自身显存
+    per_sample_vram_mb: float = 400.0,  # 单个样本的梯度显存占用（随着 seq=4 和 rollout=4 大幅增加）
+    vram_headroom_mb: float = 3072.0,   # 预留余量：极其重要！必须为同时运行的 Collector 子进程预留足够空间
     ram_headroom_mb: float = 1024.0,
     ram_per_worker_mb: float = 512.0,
 ) -> dict[str, int]:

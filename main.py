@@ -1048,16 +1048,25 @@ def run_eval_ac(args: argparse.Namespace) -> int:
     macro_context_frames = [execution_frames[0].copy() for _ in range(sequence_len)]
     candidate_grid_rollouts: list[list[np.ndarray]] | None = None
     for step_idx in range(int(args.mpc_steps or demo_cfg.get("mpc_steps", 20))):
+        step_start = time.time()
         before_plan = env.snapshot_signature()
         with torch.no_grad():
             z_ctx = encoder(frames_to_tensor(macro_context_frames, device))
             state0 = torch.from_numpy(env.get_state_vector()).to(device) if args.condition_on_state else torch.zeros(7, device=device)
+            plan_start = time.time()
             top_actions, latent_costs = planner.plan(z_ctx, goal_z, state0)
-            random_baseline = _random_latent_baseline(planner, z_ctx, goal_z, state0, planner.config.horizon)
+            plan_seconds = time.time() - plan_start
+            if bool(args.random_baseline):
+                baseline_start = time.time()
+                random_baseline = _random_latent_baseline(planner, z_ctx, goal_z, state0, planner.config.horizon)
+                baseline_seconds = time.time() - baseline_start
+            else:
+                random_baseline = float("nan")
+                baseline_seconds = 0.0
         if env.snapshot_signature() != before_plan:
             raise RuntimeError("AC planning changed the live environment state.")
         top_sequences = top_actions.detach().cpu().numpy()
-        if candidate_grid_rollouts is None:
+        if bool(args.candidate_video) and candidate_grid_rollouts is None:
             candidate_grid_rollouts = collect_candidate_rollouts(env, top_sequences, action_repeat)
         action = top_sequences[0, 0]
         reward = env.compute_reward()
@@ -1081,13 +1090,17 @@ def run_eval_ac(args: argparse.Namespace) -> int:
             "latent_cost": actual_latent_cost,
             "planned_terminal_cost": float(latent_costs[0].detach().cpu()),
             "random_baseline_cost": random_baseline,
+            "plan_seconds": plan_seconds,
+            "baseline_seconds": baseline_seconds,
+            "step_seconds": time.time() - step_start,
         }
         metrics.append(row)
+        random_text = f" random={random_baseline:.6f}" if bool(args.random_baseline) else ""
         print(
             f"step={step_idx:02d} action=({row['chosen_action0']:+.3f},{row['chosen_action1']:+.3f}) "
             f"xy=({row['x']:.4f},{row['y']:.4f}) reward={row['reward']:.4f} "
             f"latent_cost={actual_latent_cost:.6f} planned={row['planned_terminal_cost']:.6f} "
-            f"random={random_baseline:.6f}"
+            f"plan_s={plan_seconds:.2f} step_s={row['step_seconds']:.2f}{random_text}"
         )
         if done:
             break
@@ -1741,6 +1754,8 @@ def build_parser() -> argparse.ArgumentParser:
     eval_ac.add_argument("--seed", type=int)
     eval_ac.add_argument("--sequence-len", type=int, default=4, help="必须与训练时的数据采集长度保持对齐")
     eval_ac.add_argument("--condition-on-state", action=argparse.BooleanOptionalAction, default=False)
+    eval_ac.add_argument("--random-baseline", action=argparse.BooleanOptionalAction, default=False)
+    eval_ac.add_argument("--candidate-video", action=argparse.BooleanOptionalAction, default=False)
     eval_ac.set_defaults(func=run_eval_ac)
     return parser
 

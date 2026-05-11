@@ -737,6 +737,7 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
         "--oracle-elites",     str(args.oracle_elites),
         "--oracle-iters",      str(args.oracle_iters),
         "--encode-batch-size", str(args.encode_batch_size),
+        "--sequence-len",      str(args.sequence_len),
     ]
     trainer_cmd = base + [
         "train-ac-latent",
@@ -749,6 +750,7 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
         "--epochs",                str(args.final_epochs),
         "--batch-size",            str(args.batch_size),
         "--grad-accum",            str(args.grad_accum),
+        "--rollout-steps",         str(args.rollout_steps),
     ]
     if bool(args.condition_on_state):
         trainer_cmd.append("--condition-on-state")
@@ -797,18 +799,37 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
                 )
             if collector_code == 0 and trainer_code == 0:
                 break
-            # 每 10s 打印一次整体状态（分片数 + GPU 占用）。
+            # 每 10s 打印一次整体状态（分片数 + GPU 全局占用）。
+            # 注意：torch.cuda.memory_allocated() 只显示当前（父）进程的显存，
+            # 始终为 0。改用 nvidia-smi 获取所有进程的实际 GPU 占用。
             n_train = len(list(data_dir.glob("train-*.h5")))
             n_val   = len(list(data_dir.glob("val-*.h5")))
-            if torch.cuda.is_available():
-                vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
-                vram_rsv  = torch.cuda.memory_reserved()  / (1024 ** 3)
-                gpu_str = f"GPU alloc={vram_used:.2f}GB rsv={vram_rsv:.2f}GB"
-            else:
-                gpu_str = "GPU=N/A"
+            try:
+                _smi = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used,memory.total,utilization.gpu",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if _smi.returncode == 0:
+                    _parts = [p.strip() for p in _smi.stdout.strip().split(",")]
+                    gpu_str = (
+                        f"GPU {_parts[0]}MB/{_parts[1]}MB "
+                        f"util={_parts[2]}%"
+                    )
+                else:
+                    gpu_str = "GPU=unavailable"
+            except Exception:
+                gpu_str = "GPU=unavailable"
+            # 子进程存活标志
+            c_alive = "✓" if collector.poll() is None else "✗"
+            t_alive = "✓" if trainer.poll()   is None else "✗"
             print(
                 f"[pipeline] shards train={n_train}/{train_shards_expected} "
-                f"val={n_val}/{val_shards_expected}  {gpu_str}",
+                f"val={n_val}/{val_shards_expected}  {gpu_str}  "
+                f"collector={c_alive} trainer={t_alive}",
                 flush=True,
             )
             time.sleep(10.0)
@@ -990,8 +1011,11 @@ def run_eval_ac(args: argparse.Namespace) -> int:
     goal_z, target_frame, target_summary = build_goal_latent(env, encoder, device, int(args.target_steps or demo_cfg.get("target_steps", 80)))
 
     metrics: list[dict[str, float]] = []
+    sequence_len = int(getattr(args, "sequence_len", 4))
     execution_frames = [env.render().copy()]
-    macro_context_frames = [execution_frames[0].copy(), execution_frames[0].copy()]
+    # 处理数据不足 N 帧的初始情况：通过复制初始帧进行 Padding，
+    # 这样既保证送入 Predictor 的序列长度符合预期，也自然地表示“当前速度为 0”。
+    macro_context_frames = [execution_frames[0].copy() for _ in range(sequence_len)]
     candidate_grid_rollouts: list[list[np.ndarray]] | None = None
     for step_idx in range(int(args.mpc_steps or demo_cfg.get("mpc_steps", 20))):
         before_plan = env.snapshot_signature()
@@ -1010,7 +1034,9 @@ def run_eval_ac(args: argparse.Namespace) -> int:
         done = False
         frame, reward, done, _ = env.step_macro(action, action_repeat)
         execution_frames.append(frame.copy())
-        macro_context_frames = [macro_context_frames[-1], frame.copy()]
+        # 维持固定长度为 sequence_len 的滑动窗口
+        macro_context_frames.append(frame.copy())
+        macro_context_frames = macro_context_frames[-sequence_len:]
         with torch.no_grad():
             current_z = encoder(env.get_frame_tensor(str(device)))[:, -1]
             actual_latent_cost = float(mean_patch_cost(current_z, goal_z.to(device)).item())
@@ -1402,10 +1428,11 @@ def _serializable_args(args: argparse.Namespace) -> dict:
 
 
 def _make_source_schedule(windows: int, rng: np.random.Generator) -> list[str]:
-    oracle_count = int(round(windows * 0.60))
-    directional_count = int(round(windows * 0.25))
-    random_count = max(0, windows - oracle_count - directional_count)
-    sources = ["oracle"] * oracle_count + ["directional"] * directional_count + ["random"] * random_count
+    # 彻底移除极度耗时的 Oracle CEM 规划，全部使用脚本/随机探索。
+    # 这样 Collector 速度将提升百倍，能立刻喂饱 Trainer 的 GPU。
+    directional_count = int(round(windows * 0.50))
+    random_count = windows - directional_count
+    sources = ["directional"] * directional_count + ["random"] * random_count
     rng.shuffle(sources)
     return sources
 
@@ -1420,6 +1447,15 @@ def _sample_start_xy(rng: np.random.Generator) -> np.ndarray:
 
 def _scripted_actions(env, rng: np.random.Generator, sequence_len: int, source: str) -> np.ndarray:
     actions = np.zeros((sequence_len, 7), dtype=np.float32)
+    
+    # 针对包含物理惯性（damping/friction）的环境，白噪声的力会相互抵消导致原地抖动。
+    # 所以在 random 策略下，我们为整个 window 采样一个统一的基础发力方向：
+    if source == "random":
+        base_xy = rng.uniform(-1.0, 1.0, size=2).astype(np.float32)
+        # 35% 概率掺杂朝向目标方向的拉力
+        if rng.random() < 0.35:
+            base_xy += 0.4 * (env.goal_xy - env.get_agent_xy())
+            
     for step in range(sequence_len):
         if source == "directional":
             if env.get_agent_x() < 0.25:
@@ -1428,9 +1464,8 @@ def _scripted_actions(env, rng: np.random.Generator, sequence_len: int, source: 
                 xy = np.array([0.0, 1.0], dtype=np.float32)
             xy += rng.normal(0.0, 0.15, size=2).astype(np.float32)
         elif source == "random":
-            xy = rng.uniform(-1.0, 1.0, size=2).astype(np.float32)
-            if rng.random() < 0.35:
-                xy += 0.4 * (env.goal_xy - env.get_agent_xy())
+            # 基础方向 + 较小的正态分布噪声，确保能克服惯性滚起来
+            xy = base_xy + rng.normal(0.0, 0.15, size=2).astype(np.float32)
         else:
             raise ValueError(f"未知的合成数据源：{source}")
         actions[step, :2] = np.clip(xy, -1.0, 1.0)
@@ -1570,7 +1605,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--output", default="data/synthetic_ac_medium.h5")
     collect.add_argument("--train-windows", type=int, default=5000)
     collect.add_argument("--val-windows", type=int, default=500)
-    collect.add_argument("--sequence-len", type=int, default=2)
+    collect.add_argument("--sequence-len", type=int, default=4)
     collect.add_argument("--action-repeat", type=int, default=5)
     collect.add_argument("--target-steps", type=int, default=80)
     collect.add_argument("--oracle-horizon", type=int)
@@ -1586,7 +1621,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_latent.add_argument("--output-dir", default="data/ac_latent_shards")
     collect_latent.add_argument("--train-windows", type=int, default=5000)
     collect_latent.add_argument("--val-windows", type=int, default=500)
-    collect_latent.add_argument("--sequence-len", type=int, default=2)
+    collect_latent.add_argument("--sequence-len", type=int, default=4)
     collect_latent.add_argument("--action-repeat", type=int, default=5)
     collect_latent.add_argument("--target-steps", type=int, default=40)   # 原80，生成goal目标的仿真步数
     collect_latent.add_argument("--shard-size", type=int, default=128)   # 原64，更大shard减少分片开销
@@ -1610,7 +1645,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_latent.add_argument("--grad-accum", type=int, default=2)   # 原8，有效批量不变=8
     train_latent.add_argument("--lr", type=float, default=1e-4)
     train_latent.add_argument("--weight-decay", type=float, default=0.04)
-    train_latent.add_argument("--rollout-steps", type=int, default=2)
+    train_latent.add_argument("--rollout-steps", type=int, default=4)
     train_latent.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     train_latent.add_argument("--watch", action="store_true")
     train_latent.add_argument("--expected-train-shards", type=int)
@@ -1633,7 +1668,8 @@ def build_parser() -> argparse.ArgumentParser:
     pipe_latent.add_argument("--oracle-candidates", type=int, default=4)     # 原8，规划速度2×
     pipe_latent.add_argument("--oracle-elites", type=int, default=1)         # 原2
     pipe_latent.add_argument("--oracle-iters", type=int, default=1)
-    pipe_latent.add_argument("--encode-batch-size", type=int, default=32)    # 原16
+    pipe_latent.add_argument("--sequence-len", type=int, default=4)
+    pipe_latent.add_argument("--rollout-steps", type=int, default=4)
     pipe_latent.add_argument("--final-epochs", type=int, default=4)
     pipe_latent.add_argument("--batch-size", type=int, default=4)            # 原1
     pipe_latent.add_argument("--grad-accum", type=int, default=2)            # 原8，有效批量=8不变
@@ -1670,6 +1706,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_ac.add_argument("--topk-visualize", type=int, default=4)
     eval_ac.add_argument("--video-fps", type=int)
     eval_ac.add_argument("--seed", type=int)
+    eval_ac.add_argument("--sequence-len", type=int, default=4, help="必须与训练时的数据采集长度保持对齐")
     eval_ac.add_argument("--condition-on-state", action=argparse.BooleanOptionalAction, default=False)
     eval_ac.set_defaults(func=run_eval_ac)
     return parser

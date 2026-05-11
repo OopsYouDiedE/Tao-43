@@ -23,14 +23,14 @@ class PredictorConfig:
     num_layers: int = 12
     num_heads: int = 12
     dropout: float = 0.0
+    max_frames: int = 64  # 可学习帧时间嵌入的上限
 
 
 class VJEPAEncoder(nn.Module):
-    """Official V-JEPA 2.1 encoder wrapper with a stable video API.
+    """官方 V-JEPA 2.1 编码器包装器，提供稳定的视频 API。
 
-    Public input is always [B, T, 3, 384, 384]. Each frame is forwarded to the
-    official model with an explicit singleton temporal dimension, matching the
-    V-JEPA image inference path and producing 576 ViT-L patch tokens per frame.
+    公共输入始终为 [B, T, 3, 384, 384]。每一帧都通过显式的单一时间维度
+    前向传播到官方模型，匹配 V-JEPA 图像推理路径，并为每帧生成 576 个 ViT-L 补丁 token。
     """
 
     def __init__(
@@ -81,14 +81,14 @@ class VJEPAEncoder(nn.Module):
                     return self._extract_encoder(loaded)
                 except Exception as retry_exc:
                     raise RuntimeError(
-                        "Failed to load official V-JEPA 2.1 after retrying the "
-                        f"cached official hub repo with checkpoint base {self.checkpoint_base_url!r}."
+                        "在重试缓存的官方 hub 仓库后，无法加载官方 V-JEPA 2.1 模型，"
+                        f"使用的检查点基础路径为 {self.checkpoint_base_url!r}。"
                     ) from retry_exc
             if self.require_official:
                 raise RuntimeError(
-                    "Failed to load official V-JEPA 2.1 model via "
-                    f"torch.hub.load({self.hub_repo!r}, {self.model_name!r}). "
-                    "No mock fallback is allowed for this verification."
+                    "无法通过 "
+                    f"torch.hub.load({self.hub_repo!r}, {self.model_name!r}) 加载官方 V-JEPA 2.1 模型。"
+                    "此验证不允许使用 mock 回退。"
                 ) from exc
             raise
 
@@ -97,14 +97,14 @@ class VJEPAEncoder(nn.Module):
         else:
             encoder = loaded
         if not isinstance(encoder, nn.Module):
-            raise TypeError(f"Official V-JEPA hub entry returned unsupported type: {type(loaded)!r}")
+            raise TypeError(f"官方 V-JEPA hub 入口返回了不支持的类型：{type(loaded)!r}")
         return encoder
 
     def _load_official_vjepa21_small(self) -> nn.Module:
         if self.pretrained:
             raise RuntimeError(
-                "vjepa2_1_vit_small_384 is an official V-JEPA2.1 source-code "
-                "architecture with no public pretrained checkpoint in the hub."
+                "vjepa2_1_vit_small_384 是官方 V-JEPA2.1 源码中的架构，"
+                "在 hub 中没有公开的预训练检查点。"
             )
         repo_path = Path(self._cached_hub_repo_path())
         if not repo_path.exists():
@@ -137,7 +137,7 @@ class VJEPAEncoder(nn.Module):
         else:
             encoder = loaded
         if not isinstance(encoder, nn.Module):
-            raise TypeError(f"Official V-JEPA hub entry returned unsupported type: {type(loaded)!r}")
+            raise TypeError(f"官方 V-JEPA hub 入口返回了不支持的类型：{type(loaded)!r}")
         return encoder
 
     def _cached_hub_repo_path(self) -> str:
@@ -148,7 +148,7 @@ class VJEPAEncoder(nn.Module):
         repo_path = Path(self._cached_hub_repo_path())
         backbones = repo_path / "src" / "hub" / "backbones.py"
         if not backbones.exists():
-            raise FileNotFoundError(f"Cached official hub source not found: {backbones}")
+            raise FileNotFoundError(f"未找到缓存的官方 hub 源码：{backbones}")
         text = backbones.read_text(encoding="utf-8")
         old = 'VJEPA_BASE_URL = "http://localhost:8300"'
         new = f'VJEPA_BASE_URL = "{self.checkpoint_base_url}"'
@@ -166,26 +166,26 @@ class VJEPAEncoder(nn.Module):
     @torch.no_grad()
     def forward(self, frames: Tensor) -> Tensor:
         if frames.ndim != 5:
-            raise ValueError(f"VJEPAEncoder expects [B, T, 3, 384, 384], got {tuple(frames.shape)}")
+            raise ValueError(f"VJEPAEncoder 期望输入 [B, T, 3, 384, 384]，实际得到 {tuple(frames.shape)}")
         batch, time, channels, height, width = frames.shape
         if channels != 3 or height != self.image_size or width != self.image_size:
-            raise ValueError(f"Expected RGB {self.image_size}x{self.image_size} frames, got {tuple(frames.shape)}")
+            raise ValueError(f"期望 RGB {self.image_size}x{self.image_size} 格式的帧，实际得到 {tuple(frames.shape)}")
         if frames.min().item() < -1e-6 or frames.max().item() > 1.0 + 1e-6:
-            raise ValueError("VJEPAEncoder expects pixel values normalized to [0.0, 1.0].")
+            raise ValueError("VJEPAEncoder 期望像素值被归一化到 [0.0, 1.0] 范围内。")
 
         x = frames.to(self.device, non_blocking=True).reshape(batch * time, channels, height, width)
-        x = x.unsqueeze(2)  # [B*T, 3, 1, 384, 384], explicit temporal dimension.
+        x = x.unsqueeze(2)  # [B*T, 3, 1, 384, 384]，显式的时间维度。
         z = self.encoder(x)
         z = _unwrap_encoder_output(z)
         if z.ndim != 3:
             raise RuntimeError(
-                "Official V-JEPA encoder returned "
-                f"{tuple(z.shape)}, expected [B*T, {self.patches_per_frame}, {self.embed_dim}]."
+                "官方 V-JEPA 编码器返回 "
+                f"{tuple(z.shape)}，期望 [B*T, {self.patches_per_frame}, {self.embed_dim}]。"
             )
         if z.shape[1:] != (self.patches_per_frame, self.embed_dim):
             raise RuntimeError(
-                "Official V-JEPA encoder output shape mismatch: "
-                f"got {tuple(z.shape)}, expected [B*T, {self.patches_per_frame}, {self.embed_dim}]."
+                "官方 V-JEPA 编码器输出形状不匹配： "
+                f"得到 {tuple(z.shape)}，期望 [B*T, {self.patches_per_frame}, {self.embed_dim}]。"
             )
         return z.reshape(batch, time, self.patches_per_frame, self.embed_dim)
 
@@ -200,7 +200,7 @@ def _unwrap_encoder_output(output: Any) -> Tensor:
             value = output.get(key)
             if isinstance(value, Tensor):
                 return value
-    raise TypeError(f"Unsupported V-JEPA encoder output type: {type(output)!r}")
+    raise TypeError(f"不支持的 V-JEPA 编码器输出类型：{type(output)!r}")
 
 
 def _mentions_localhost_checkpoint(exc: BaseException) -> bool:
@@ -213,7 +213,7 @@ def _mentions_localhost_checkpoint(exc: BaseException) -> bool:
 
 
 class ActionConditionedPredictor(nn.Module):
-    """Transformer predictor over interleaved action, state, and visual tokens."""
+    """基于交错的动作、状态和视觉 token 的 Transformer 预测器。"""
 
     def __init__(self, config: PredictorConfig | None = None) -> None:
         super().__init__()
@@ -222,6 +222,13 @@ class ActionConditionedPredictor(nn.Module):
         self.visual_proj = nn.Linear(cfg.visual_dim, cfg.pred_dim)
         self.action_proj = nn.Linear(cfg.action_dim, cfg.pred_dim)
         self.state_proj = nn.Linear(cfg.state_dim, cfg.pred_dim)
+
+        # 为视觉 token 提供可学习的时间嵌入（修复：区分
+        # 不同时间步下的相同补丁；动作/状态则使用 RoPE）。
+        self.frame_temporal_embed = nn.Parameter(
+            torch.zeros(cfg.max_frames, cfg.pred_dim)
+        )
+        nn.init.normal_(self.frame_temporal_embed, std=0.02)
 
         layer = nn.TransformerEncoderLayer(
             d_model=cfg.pred_dim,
@@ -250,10 +257,11 @@ class ActionConditionedPredictor(nn.Module):
     def interleave_tokens(self, visual_tokens: Tensor, actions: Tensor, states: Tensor) -> Tensor:
         self._validate_inputs(visual_tokens, actions, states)
         batch, time, patches, _ = visual_tokens.shape
-        visual = self.visual_proj(visual_tokens)
-        action = self.action_proj(actions).unsqueeze(2)
-        state = self.state_proj(states).unsqueeze(2)
-        action_state = torch.cat([action, state], dim=2)
+        if time > self.config.max_frames:
+            raise ValueError(f"输入有 {time} 帧，但 max_frames={self.config.max_frames}。")
+
+        visual = self.visual_proj(visual_tokens) + self.frame_temporal_embed[:time].view(1, time, 1, -1)
+        action_state = torch.stack([self.action_proj(actions), self.state_proj(states)], dim=2)
         action_state = self._apply_temporal_rope(action_state)
         per_frame = torch.cat([action_state, visual], dim=2)
         return per_frame.reshape(batch, time * (patches + 2), self.config.pred_dim)
@@ -262,7 +270,7 @@ class ActionConditionedPredictor(nn.Module):
         batch, seq_len, dim = encoded.shape
         expected = num_frames * TOKENS_PER_FRAME
         if seq_len != expected:
-            raise ValueError(f"Encoded sequence has {seq_len} tokens, expected {expected}.")
+            raise ValueError(f"编码后的序列有 {seq_len} 个 token，期望 {expected} 个。")
         framed = encoded.reshape(batch, num_frames, TOKENS_PER_FRAME, dim)
         return framed[:, :, 2:, :]
 
@@ -275,15 +283,14 @@ class ActionConditionedPredictor(nn.Module):
     def _apply_temporal_rope(self, tokens: Tensor) -> Tensor:
         batch, time, two_tokens, dim = tokens.shape
         if two_tokens != 2 or dim % 2 != 0:
-            raise ValueError("RoPE expects [B, T, 2, even_dim] action/state tokens.")
+            raise ValueError("RoPE 期望 [B, T, 2, 偶数维度] 的动作/状态 token。")
 
         pos = torch.arange(time, device=tokens.device, dtype=tokens.dtype)
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=tokens.device, dtype=tokens.dtype) / dim))
-        angles = pos[:, None] * inv_freq[None, :]
-        cos = angles.cos()[None, :, None, :]
-        sin = angles.sin()[None, :, None, :]
-        even = tokens[..., 0::2]
-        odd = tokens[..., 1::2]
+        angles = torch.outer(pos, inv_freq)
+        cos, sin = angles.cos().view(1, time, 1, -1), angles.sin().view(1, time, 1, -1)
+        even, odd = tokens[..., 0::2], tokens[..., 1::2]
+        
         rotated = torch.empty_like(tokens)
         rotated[..., 0::2] = even * cos - odd * sin
         rotated[..., 1::2] = even * sin + odd * cos
@@ -291,19 +298,19 @@ class ActionConditionedPredictor(nn.Module):
 
     def _validate_inputs(self, visual_tokens: Tensor, actions: Tensor, states: Tensor) -> None:
         if visual_tokens.ndim != 4:
-            raise ValueError(f"visual_tokens must be [B, T, 576, 1024], got {tuple(visual_tokens.shape)}")
+            raise ValueError(f"visual_tokens 必须是 [B, T, 576, 1024]，实际得到 {tuple(visual_tokens.shape)}")
         if visual_tokens.shape[2:] != (PATCHES_PER_FRAME, self.config.visual_dim):
-            raise ValueError(f"Unexpected visual token shape: {tuple(visual_tokens.shape)}")
+            raise ValueError(f"未知的视觉 token 形状：{tuple(visual_tokens.shape)}")
         expected_side = visual_tokens.shape[:2] + (self.config.action_dim,)
         if actions.shape != expected_side:
-            raise ValueError(f"actions must be {expected_side}, got {tuple(actions.shape)}")
+            raise ValueError(f"actions 必须是 {expected_side}，实际得到 {tuple(actions.shape)}")
         expected_state = visual_tokens.shape[:2] + (self.config.state_dim,)
         if states.shape != expected_state:
-            raise ValueError(f"states must be {expected_state}, got {tuple(states.shape)}")
+            raise ValueError(f"states 必须是 {expected_state}，实际得到 {tuple(states.shape)}")
 
 
 def mean_patch_cost(predicted: Tensor, goal: Tensor) -> Tensor:
     if predicted.shape[-2:] != goal.shape[-2:]:
-        raise ValueError(f"Feature shapes differ: {tuple(predicted.shape)} vs {tuple(goal.shape)}")
+        raise ValueError(f"特征形状不同：{tuple(predicted.shape)} 对比 {tuple(goal.shape)}")
     diff = predicted.mean(dim=-2) - goal.mean(dim=-2)
     return diff.square().sum(dim=-1)

@@ -78,7 +78,7 @@ class RollbackMuJoCoEnv:
 
     def pop_state(self) -> None:
         if not self._phys_stack:
-            raise RuntimeError("Rollback stack is empty; cannot pop_state().")
+            raise RuntimeError("回滚栈为空；无法调用 pop_state()。")
         state = self._phys_stack.pop()
         ctrl = self._ctrl_stack.pop()
         frames = self._frame_stack.pop()
@@ -110,7 +110,7 @@ class RollbackMuJoCoEnv:
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, dict]:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         if action.shape != (self.action_dim,):
-            raise ValueError(f"Expected 7D action, got {action.shape}.")
+            raise ValueError(f"期望 7D 动作，实际得到 {action.shape}。")
         action = np.clip(action, -1.0, 1.0)
         self.physics.data.ctrl[0] = float(action[0])
         self.physics.data.ctrl[1] = float(action[1])
@@ -139,14 +139,15 @@ class RollbackMuJoCoEnv:
         )
 
     def get_state_vector(self) -> np.ndarray:
-        state = np.zeros(self.state_dim, dtype=np.float32)
-        state[0] = self.get_agent_x()
-        state[1] = self.get_agent_y()
-        state[2] = 0.08
-        state[3] = float(self.physics.named.data.qvel["slide_x"])
-        state[4] = float(self.physics.named.data.qvel["slide_y"])
-        state[6] = 1.0
-        return state
+        return np.array([
+            self.get_agent_x(),
+            self.get_agent_y(),
+            0.08,
+            self.physics.named.data.qvel["slide_x"],
+            self.physics.named.data.qvel["slide_y"],
+            0.0,
+            1.0
+        ], dtype=np.float32)
 
     def get_agent_x(self) -> float:
         return float(self.start_xy[0] + self.physics.named.data.qpos["slide_x"])
@@ -192,7 +193,7 @@ class RollbackMuJoCoEnv:
         import torch
 
         if len(self.frame_buffer) != self.frame_buffer_len:
-            raise RuntimeError("Frame buffer is not full; call reset() first.")
+            raise RuntimeError("帧缓冲区未满；请先调用 reset()。")
         frames = np.stack(list(self.frame_buffer), axis=0)
         frames = frames.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
         tensor = torch.from_numpy(frames).unsqueeze(0)
@@ -202,17 +203,14 @@ class RollbackMuJoCoEnv:
         import torch
 
         if len(self.frame_buffer) != self.frame_buffer_len:
-            raise RuntimeError("Frame buffer is not full; call reset() first.")
+            raise RuntimeError("帧缓冲区未满；请先调用 reset()。")
         frames = np.stack([self.frame_buffer[0], self.frame_buffer[-1]], axis=0)
         frames = frames.transpose(0, 3, 1, 2).astype(np.float32) / 255.0
         tensor = torch.from_numpy(frames).unsqueeze(0)
         return tensor.to(device) if device else tensor
 
     def sample_action(self, x_delta: float = 0.25, y_delta: float = 0.0) -> np.ndarray:
-        action = np.zeros(self.action_dim, dtype=np.float32)
-        action[0] = x_delta
-        action[1] = y_delta
-        return action
+        return np.array([x_delta, y_delta, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
     def rollout_sequence(self, actions: np.ndarray, record_frames: bool = False) -> dict:
         frames: list[np.ndarray] = []

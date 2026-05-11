@@ -39,41 +39,35 @@ class LatentCEMPlanner:
 
     @torch.no_grad()
     def rollout_latent(self, z_ctx: Tensor, actions: Tensor, states: Tensor) -> Tensor:
-        cfg = self.config
         z_window = z_ctx.to(self.device)
-        actions = actions.to(self.device)
-        states = states.to(self.device)
+        actions, states = actions.to(self.device), states.to(self.device)
         batch, ctx_len, patches, visual_dim = z_window.shape
         horizon = actions.shape[1]
         if actions.shape != (batch, horizon, 7) or states.shape != (batch, horizon, 7):
-            raise ValueError("actions and states must be [B, H, 7].")
+            raise ValueError("actions 和 states 必须是 [B, H, 7] 的形状。")
 
         preds: list[Tensor] = []
+        cond_actions = torch.zeros(batch, ctx_len, 7, device=self.device, dtype=z_window.dtype)
+        cond_states = torch.zeros(batch, ctx_len, 7, device=self.device, dtype=z_window.dtype)
         for step in range(horizon):
-            cond_actions = torch.zeros(batch, ctx_len, 7, device=self.device, dtype=z_window.dtype)
-            cond_states = torch.zeros(batch, ctx_len, 7, device=self.device, dtype=z_window.dtype)
             cond_actions[:, -1] = actions[:, step]
             cond_states[:, -1] = states[:, step]
             pred_window = self.predictor(z_window, cond_actions, cond_states)
             next_z = pred_window[:, -1]
             preds.append(next_z)
             z_window = torch.cat([z_window[:, 1:], next_z[:, None]], dim=1)
-            if z_window.shape != (batch, ctx_len, patches, visual_dim):
-                raise RuntimeError("Latent sliding window shape changed unexpectedly.")
         return torch.stack(preds, dim=1)
 
     @torch.no_grad()
     def evaluate_sequences(self, z_ctx: Tensor, goal_z: Tensor, actions: Tensor, state0: Tensor) -> Tensor:
-        n_candidates = actions.shape[0]
         costs: list[Tensor] = []
-        for start in range(0, n_candidates, self.config.chunk_size):
+        state_expanded = state0.to(self.device).view(1, 1, 7).expand(-1, actions.shape[1], 7)
+        for start in range(0, actions.shape[0], self.config.chunk_size):
             chunk = actions[start : start + self.config.chunk_size].to(self.device)
-            chunk_size = chunk.shape[0]
-            z_batch = z_ctx.to(self.device).expand(chunk_size, -1, -1, -1).contiguous()
-            state_batch = state0.to(self.device).reshape(1, 1, 7).expand(chunk_size, chunk.shape[1], 7)
+            z_batch = z_ctx.to(self.device).expand(chunk.shape[0], -1, -1, -1).contiguous()
+            state_batch = state_expanded.expand(chunk.shape[0], -1, -1)
             rollout = self.rollout_latent(z_batch, chunk, state_batch)
-            goal = goal_z.to(self.device).expand(chunk_size, -1, -1)
-            costs.append(mean_patch_cost(rollout[:, -1], goal))
+            costs.append(mean_patch_cost(rollout[:, -1], goal_z.to(self.device).expand(chunk.shape[0], -1, -1)))
         return torch.cat(costs, dim=0)
 
     @torch.no_grad()
@@ -120,7 +114,7 @@ class LatentCEMPlanner:
                 best_seq = seq
                 best_cost = cost
         if best_seq is None:
-            raise RuntimeError("Physics verification received no action sequences.")
+            raise RuntimeError("物理验证未接收到任何动作序列。")
         return best_seq, best_cost
 
 
@@ -174,7 +168,7 @@ class OraclePlanResult:
 
 
 class OracleCEMPlanner:
-    """Simulator-in-the-loop CEM planner for the pre-action-head phase."""
+    """用于预动作头阶段的在环模拟器 CEM 规划器。"""
 
     def __init__(self, encoder, config: OracleCEMConfig | None = None, device: torch.device | str = "cpu") -> None:
         self.encoder = encoder
@@ -234,7 +228,7 @@ class OracleCEMPlanner:
             last_ys = ys
 
         if last_sequences is None or last_costs is None or last_rewards is None or last_xs is None or last_ys is None:
-            raise RuntimeError("Oracle CEM did not evaluate any candidates.")
+            raise RuntimeError("Oracle CEM 未能评估任何候选序列。")
 
         order = np.argsort(last_costs)
         topk = min(cfg.topk_visualize, len(order))
@@ -278,9 +272,9 @@ class OracleCEMPlanner:
                 env.pop_state()
             after = env.snapshot_signature()
             if before != after:
-                raise RuntimeError("Rollback signature changed after oracle candidate evaluation.")
+                raise RuntimeError("在评估 Oracle 候选序列后，回滚签名发生了变化。")
             if env.stack_depth != 0:
-                raise RuntimeError("Oracle candidate evaluation leaked rollback stack state.")
+                raise RuntimeError("Oracle 候选序列评估导致回滚栈状态泄露。")
 
         frames = torch.stack(terminal_tensors, dim=0)
         costs: list[Tensor] = []
@@ -301,38 +295,20 @@ class OracleCEMPlanner:
         )
 
     def _inject_directional_priors(self, scalar_samples: np.ndarray, env: RollbackMuJoCoEnv) -> None:
-        half = max(1, scalar_samples.shape[1] // 2)
-        if env.get_agent_x() > 0.25:
-            if scalar_samples.shape[0] >= 1:
-                scalar_samples[0, :, 0] = 0.0
-                scalar_samples[0, :, 1] = 1.0
-            if scalar_samples.shape[0] >= 2:
-                scalar_samples[1, :, 0] = -0.3
-                scalar_samples[1, :, 1] = 1.0
-            if scalar_samples.shape[0] >= 3:
-                scalar_samples[2, :, 0] = 0.3
-                scalar_samples[2, :, 1] = 1.0
-            if scalar_samples.shape[0] >= 4:
-                scalar_samples[3, :, 0] = 0.0
-                scalar_samples[3, :, 1] = 0.0
-            return
-        if scalar_samples.shape[0] >= 1:
-            scalar_samples[0, :half, 0] = 1.0
-            scalar_samples[0, :half, 1] = 0.0
-            scalar_samples[0, half:, 0] = 0.5
-            scalar_samples[0, half:, 1] = 1.0
-        if scalar_samples.shape[0] >= 2:
-            scalar_samples[1, :, 0] = 1.0
-            scalar_samples[1, :, 1] = 1.0
-        if scalar_samples.shape[0] >= 3:
-            scalar_samples[2, :, 0] = 1.0
-            scalar_samples[2, :, 1] = -1.0
-        if scalar_samples.shape[0] >= 4:
-            scalar_samples[3, :, 0] = 1.0
-            scalar_samples[3, :, 1] = 0.0
-        if scalar_samples.shape[0] >= 5:
-            scalar_samples[4, :, 0] = 0.0
-            scalar_samples[4, :, 1] = 1.0
+        priors = (
+            [(0.0, 1.0), (-0.3, 1.0), (0.3, 1.0), (0.0, 0.0)]
+            if env.get_agent_x() > 0.25
+            else [(None, None), (1.0, 1.0), (1.0, -1.0), (1.0, 0.0), (0.0, 1.0)]
+        )
+        for i, prior in enumerate(priors):
+            if i >= scalar_samples.shape[0]:
+                break
+            if prior == (None, None):  # 特殊的两阶段先验
+                half = max(1, scalar_samples.shape[1] // 2)
+                scalar_samples[i, :half, 0], scalar_samples[i, :half, 1] = 1.0, 0.0
+                scalar_samples[i, half:, 0], scalar_samples[i, half:, 1] = 0.5, 1.0
+            else:
+                scalar_samples[i, :, 0], scalar_samples[i, :, 1] = prior
 
     @staticmethod
     def _to_7d_actions(action_samples: np.ndarray) -> np.ndarray:

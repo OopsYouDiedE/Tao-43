@@ -21,13 +21,13 @@ class HDF5EpisodeDataset(Dataset):
         with h5py.File(self.path, "r") as h5:
             self.length = int(h5["frames"].shape[0])
             if h5["frames"].shape[1:] != (384, 384, 3):
-                raise ValueError("frames must be [Episode_Len, 384, 384, 3].")
+                raise ValueError("frames 必须是 [Episode_Len, 384, 384, 3]。")
             if h5["actions"].shape != (self.length - 1, 7):
-                raise ValueError("actions must be [Episode_Len - 1, 7].")
+                raise ValueError("actions 必须是 [Episode_Len - 1, 7]。")
             if h5["states"].shape != (self.length - 1, 7):
-                raise ValueError("states must be [Episode_Len - 1, 7].")
+                raise ValueError("states 必须是 [Episode_Len - 1, 7]。")
         if self.length < sequence_len + 1:
-            raise ValueError("Episode is shorter than requested sequence length.")
+            raise ValueError("Episode 长度小于请求的序列长度。")
 
     def __len__(self) -> int:
         return self.length - self.sequence_len
@@ -51,17 +51,17 @@ class HDF5WindowDataset(Dataset):
         self.split = split
         with h5py.File(self.path, "r") as h5:
             if split not in h5:
-                raise ValueError(f"HDF5 dataset has no split {split!r}.")
+                raise ValueError(f"HDF5 数据集没有名为 {split!r} 的 split。")
             group = h5[split]
             frames = group["frames"]
             actions = group["actions"]
             states = group["states"]
             if frames.ndim != 5 or frames.shape[2:] != (384, 384, 3):
-                raise ValueError(f"{split}/frames must be [N, T+1, 384, 384, 3].")
+                raise ValueError(f"{split}/frames 必须是 [N, T+1, 384, 384, 3]。")
             if actions.shape[:2] != (frames.shape[0], frames.shape[1] - 1) or actions.shape[2] != 7:
-                raise ValueError(f"{split}/actions must be [N, T, 7].")
+                raise ValueError(f"{split}/actions 必须是 [N, T, 7]。")
             if states.shape != actions.shape:
-                raise ValueError(f"{split}/states must match actions shape [N, T, 7].")
+                raise ValueError(f"{split}/states 必须与 actions 形状一致 [N, T, 7]。")
             self.length = int(frames.shape[0])
             self.sequence_len = int(actions.shape[1])
 
@@ -99,7 +99,7 @@ def compute_ac_predictor_loss(
     rollout_steps: int = 2,
 ) -> tuple[Tensor, dict[str, float]]:
     if frames.ndim != 5:
-        raise ValueError(f"frames must be [B, T+1, 3, 384, 384], got {tuple(frames.shape)}")
+        raise ValueError(f"frames 必须是 [B, T+1, 3, 384, 384]，实际得到 {tuple(frames.shape)}")
     with torch.no_grad():
         z = encoder(frames)
     z_in = z[:, :-1]
@@ -109,17 +109,12 @@ def compute_ac_predictor_loss(
 
     rollout_losses = []
     z_window = z[:, :1]
-    action_window = actions[:, :1]
-    state_window = states[:, :1]
     steps = min(rollout_steps, actions.shape[1])
     for step in range(steps):
-        pred = predictor(z_window, action_window, state_window)
+        pred = predictor(z_window, actions[:, :step + 1], states[:, :step + 1])
         next_z = pred[:, -1]
         rollout_losses.append(F.smooth_l1_loss(next_z, z[:, step + 1]))
         z_window = torch.cat([z_window, next_z[:, None]], dim=1)
-        if step + 1 < steps:
-            action_window = torch.cat([action_window, actions[:, step + 1 : step + 2]], dim=1)
-            state_window = torch.cat([state_window, states[:, step + 1 : step + 2]], dim=1)
     loss_roll = torch.stack(rollout_losses).mean() if rollout_losses else torch.zeros_like(loss_tf)
     total = loss_tf + 0.5 * loss_roll
     return total, {
@@ -140,7 +135,7 @@ def compute_ac_predictor_latent_loss(
     action_contrast_weight: float = 0.2,
 ) -> tuple[Tensor, dict[str, float]]:
     if z.ndim != 4:
-        raise ValueError(f"z must be [B, T+1, 576, 768], got {tuple(z.shape)}")
+        raise ValueError(f"z 必须是 [B, T+1, 576, 768]，实际得到 {tuple(z.shape)}")
     z_in = z[:, :-1]
     z_target = z[:, 1:]
     pred_tf = predictor(z_in, actions, states)
@@ -151,11 +146,9 @@ def compute_ac_predictor_latent_loss(
     rollout_losses = []
     rollout_delta_losses = []
     z_window = z[:, :1]
-    action_window = actions[:, :1]
-    state_window = states[:, :1]
     steps = min(rollout_steps, actions.shape[1])
     for step in range(steps):
-        pred = predictor(z_window, action_window, state_window)
+        pred = predictor(z_window, actions[:, :step + 1], states[:, :step + 1])
         next_z = pred[:, -1]
         rollout_losses.append(_weighted_smooth_l1(next_z[:, None], z[:, step + 1 : step + 2], weights[:, step + 1 : step + 2]))
         rollout_delta_losses.append(
@@ -166,9 +159,6 @@ def compute_ac_predictor_latent_loss(
             )
         )
         z_window = torch.cat([z_window, next_z[:, None]], dim=1)
-        if step + 1 < steps:
-            action_window = torch.cat([action_window, actions[:, step + 1 : step + 2]], dim=1)
-            state_window = torch.cat([state_window, states[:, step + 1 : step + 2]], dim=1)
     loss_roll = torch.stack(rollout_losses).mean() if rollout_losses else torch.zeros_like(loss_tf)
     loss_delta_roll = torch.stack(rollout_delta_losses).mean() if rollout_delta_losses else torch.zeros_like(loss_tf)
     loss_action_contrast = _action_contrastive_loss(predictor, z_in, actions, states, pred_tf.detach(), weights[:, 1:])
@@ -204,16 +194,32 @@ def _action_contrastive_loss(
     positive_pred: Tensor,
     weights: Tensor,
 ) -> Tensor:
+    """如果乱序动作的预测结果与真实动作无法区分，则施加惩罚。
+
+    注意：要求 batch_size >= 2 才能产生非零值。当使用 --batch-size 1
+    训练时，该项始终为 0；请使用 --grad-accum 保持有效的
+    大批量，并设置 --batch-size >= 2 以激活此损失。
+    """
     if actions.shape[0] < 2:
         return torch.zeros((), device=z_in.device, dtype=z_in.dtype)
-    perm = torch.roll(torch.arange(actions.shape[0], device=actions.device), shifts=1)
+    # 随机排列（绝不为恒等映射），以避免模型学习到固定的平移模式。
+    perm = torch.randperm(actions.shape[0], device=actions.device)
+    # 防止极端情况下 randperm 返回恒等映射。
+    if torch.equal(perm, torch.arange(actions.shape[0], device=actions.device)):
+        perm = torch.roll(perm, shifts=1)
     shuffled_actions = actions[perm]
     if torch.allclose(shuffled_actions, actions):
         return torch.zeros((), device=z_in.device, dtype=z_in.dtype)
     negative_pred = predictor(z_in, shuffled_actions, states)
-    separation = ((negative_pred - positive_pred).square().mean(dim=-1) * weights).sum() / weights.sum().clamp_min(1.0)
-    positive_motion = ((positive_pred - z_in).square().mean(dim=-1) * weights).sum() / weights.sum().clamp_min(1.0)
-    return F.relu(0.05 * positive_motion.detach() - separation)
+    separation = (
+        (negative_pred - positive_pred).square().mean(dim=-1) * weights
+    ).sum() / weights.sum().clamp_min(1.0)
+    positive_motion = (
+        (positive_pred - z_in).square().mean(dim=-1) * weights
+    ).sum() / weights.sum().clamp_min(1.0)
+    # Hinge 损失：仅在 separation < margin * positive_motion 时施加惩罚。
+    margin = 0.05
+    return torch.nn.functional.relu(margin * positive_motion.detach() - separation)
 
 
 class EMAEncoder(nn.Module):
@@ -232,7 +238,7 @@ class EMAEncoder(nn.Module):
 
 def apply_block_mask(frames: Tensor, mask_ratio: float = 0.75, patch_size: int = 16) -> tuple[Tensor, Tensor]:
     if frames.ndim != 5:
-        raise ValueError("frames must be [B, T, 3, 384, 384].")
+        raise ValueError("frames 必须是 [B, T, 3, 384, 384]。")
     batch, time, channels, height, width = frames.shape
     grid_h = height // patch_size
     grid_w = width // patch_size
@@ -246,20 +252,19 @@ def apply_block_mask(frames: Tensor, mask_ratio: float = 0.75, patch_size: int =
 
 def set_trainable_last_blocks(encoder: nn.Module, n_blocks: int) -> None:
     if not 2 <= n_blocks <= 8:
-        raise ValueError("V-JEPA fine-tuning only allows unfreezing the last 2 to 8 blocks.")
+        raise ValueError("V-JEPA 微调仅允许解冻最后 2 到 8 个 block。")
     for param in encoder.parameters():
         param.requires_grad_(False)
 
-    blocks = None
-    for attr in ("blocks", "encoder"):
-        candidate = getattr(encoder, attr, None)
-        if isinstance(candidate, nn.ModuleList):
-            blocks = candidate
-            break
-    if blocks is None and hasattr(encoder, "module"):
+    if hasattr(encoder, "module"):
         return set_trainable_last_blocks(encoder.module, n_blocks)
-    if blocks is None:
-        raise AttributeError("Could not find transformer blocks on the official V-JEPA encoder.")
+
+    blocks = getattr(encoder, "blocks", None)
+    if blocks is None and hasattr(encoder, "encoder"):
+        blocks = getattr(encoder.encoder, "blocks", None)
+        
+    if not isinstance(blocks, nn.ModuleList):
+        raise AttributeError("在官方 V-JEPA 编码器上找不到 transformer block。")
 
     for block in blocks[-n_blocks:]:
         for param in block.parameters():

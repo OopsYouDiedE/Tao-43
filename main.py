@@ -5,7 +5,6 @@ import csv
 import gc
 import math
 import os
-import random
 import shutil
 import subprocess
 import sys
@@ -13,86 +12,34 @@ import time
 from pathlib import Path
 
 import h5py
-import imageio.v2 as imageio
 import numpy as np
 import torch
-import yaml
 from torch.utils.data import DataLoader
 
-from core_models import ActionConditionedPredictor, PredictorConfig, TOKENS_PER_FRAME, VJEPAEncoder, mean_patch_cost
+from core_models import ActionConditionedPredictor, TOKENS_PER_FRAME, mean_patch_cost
 from environment import make_smoke_env
 from latent_planner import LatentCEMPlanner, OracleCEMPlanner, oracle_cem_config_from_dict, cem_config_from_dict
 from trainer_engine import HDF5WindowDataset, compute_ac_predictor_latent_loss, compute_ac_predictor_loss
+from utils import (
+    setup_run,
+    build_encoder,
+    predictor_config_from_dict,
+    frames_to_tensor,
+    arg_or_config,
+    build_goal_latent,
+    evaluate_direct_vs_detour,
+    collect_candidate_rollouts,
+    make_candidate_grid_frames,
+    save_run_videos,
+    write_metrics_csv,
+    write_summary_html,
+)
 
 
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
-
-
-def select_device(config: dict) -> torch.device:
-    prefer_cuda = bool(config.get("device", {}).get("prefer_cuda", True))
-    if prefer_cuda and torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def frames_to_tensor(frames: list[np.ndarray] | np.ndarray, device: torch.device | str | None = None) -> torch.Tensor:
-    array = np.asarray(frames)
-    if array.ndim != 4 or array.shape[-1] != 3:
-        raise ValueError(f"frames must be [T, H, W, 3], got {array.shape}")
-    array = array.astype(np.float32) / 255.0
-    tensor = torch.from_numpy(array).permute(0, 3, 1, 2).unsqueeze(0)
-    return tensor.to(device) if device else tensor
-
-
-def assert_python_310() -> None:
-    if sys.version_info[:2] != (3, 10):
-        version = ".".join(map(str, sys.version_info[:3]))
-        raise RuntimeError(f"Verification must run on Python 3.10, got Python {version}.")
-
-
-def predictor_config_from_dict(data: dict) -> PredictorConfig:
-    allowed = PredictorConfig.__dataclass_fields__.keys()
-    return PredictorConfig(**{key: data[key] for key in allowed if key in data})
-
-
-def build_encoder(config: dict, require_official: bool, device: torch.device) -> VJEPAEncoder:
-    vjepa_cfg = config["vjepa"]
-    if require_official and not bool(vjepa_cfg.get("require_official", True)):
-        raise RuntimeError("--require-official-vjepa requires configs.yaml vjepa.require_official=true.")
-    encoder = VJEPAEncoder(
-        hub_repo=vjepa_cfg["hub_repo"],
-        model_name=vjepa_cfg["model_name"],
-        require_official=require_official,
-        pretrained=bool(vjepa_cfg.get("pretrained", True)),
-        checkpoint_base_url=vjepa_cfg.get("checkpoint_base_url"),
-        patches_per_frame=int(vjepa_cfg["patches_per_frame"]),
-        embed_dim=int(vjepa_cfg["embed_dim"]),
-        image_size=int(vjepa_cfg["image_size"]),
-        device=device,
-    )
-    print(f"official_vjepa: loaded {vjepa_cfg['model_name']} pretrained={bool(vjepa_cfg.get('pretrained', True))}")
-    return encoder
 
 
 def run_verify(args: argparse.Namespace) -> int:
-    assert_python_310()
-    config = load_config(args.config)
-    set_seed(int(config.get("seed", 43)))
-    device = select_device(config)
-    print(f"python: {sys.version.split()[0]}")
-    print(f"torch: {torch.__version__}")
-    print(f"device: {device}")
-
+    config, device, _ = setup_run(args)
     vjepa_cfg = config["vjepa"]
     encoder = build_encoder(config, args.require_official_vjepa, device)
 
@@ -186,19 +133,13 @@ def run_verify(args: argparse.Namespace) -> int:
 
 
 def run_oracle_demo(args: argparse.Namespace) -> int:
-    assert_python_310()
-    config = load_config(args.config)
-    set_seed(int(config.get("seed", 43)))
-    device = select_device(config)
-    print(f"python: {sys.version.split()[0]}")
-    print(f"torch: {torch.__version__}")
-    print(f"device: {device}")
+    config, device, _ = setup_run(args)
     encoder = build_encoder(config, args.require_official_vjepa, device)
 
     demo_cfg = dict(config.get("oracle_demo", {}))
-    mpc_steps = _arg_or_config(args.mpc_steps, demo_cfg, "mpc_steps", 20)
-    target_steps = _arg_or_config(args.target_steps, demo_cfg, "target_steps", 80)
-    video_fps = _arg_or_config(args.video_fps, demo_cfg, "video_fps", 12)
+    mpc_steps = arg_or_config(args.mpc_steps, demo_cfg, "mpc_steps", 20)
+    target_steps = arg_or_config(args.target_steps, demo_cfg, "target_steps", 80)
+    video_fps = arg_or_config(args.video_fps, demo_cfg, "video_fps", 12)
     output_dir = Path(args.output_dir or demo_cfg.get("output_dir", "runs/oracle_demo/latest"))
     output_dir = output_dir.resolve()
     if output_dir.exists():
@@ -207,16 +148,16 @@ def run_oracle_demo(args: argparse.Namespace) -> int:
 
     oracle_cfg = oracle_cem_config_from_dict(
         {
-            "horizon": _arg_or_config(args.horizon, demo_cfg, "horizon", 8),
-            "n_candidates": _arg_or_config(args.candidates, demo_cfg, "n_candidates", 32),
-            "n_elites": _arg_or_config(args.elites, demo_cfg, "n_elites", 8),
-            "n_iters": _arg_or_config(args.iters, demo_cfg, "n_iters", 3),
+            "horizon": arg_or_config(args.horizon, demo_cfg, "horizon", 8),
+            "n_candidates": arg_or_config(args.candidates, demo_cfg, "n_candidates", 32),
+            "n_elites": arg_or_config(args.elites, demo_cfg, "n_elites", 8),
+            "n_iters": arg_or_config(args.iters, demo_cfg, "n_iters", 3),
             "action_dims": int(demo_cfg.get("action_dims", 2)),
-            "action_repeat": _arg_or_config(args.action_repeat, demo_cfg, "action_repeat", 5),
+            "action_repeat": arg_or_config(args.action_repeat, demo_cfg, "action_repeat", 5),
             "distance_cost_weight": float(demo_cfg.get("distance_cost_weight", 1.0)),
             "use_action_priors": bool(demo_cfg.get("use_action_priors", False)),
-            "encode_batch_size": _arg_or_config(args.encode_batch_size, demo_cfg, "encode_batch_size", 4),
-            "topk_visualize": _arg_or_config(args.topk_visualize, demo_cfg, "topk_visualize", 4),
+            "encode_batch_size": arg_or_config(args.encode_batch_size, demo_cfg, "encode_batch_size", 4),
+            "topk_visualize": arg_or_config(args.topk_visualize, demo_cfg, "topk_visualize", 4),
             "seed": int(config.get("seed", 43)),
         }
     )
@@ -321,24 +262,7 @@ def run_oracle_demo(args: argparse.Namespace) -> int:
             f"goal_xy=({env.goal_x:.4f},{env.goal_y:.4f})"
         )
 
-    execution_video = output_dir / "execution.mp4"
-    imageio.mimsave(execution_video, execution_frames, fps=video_fps, codec="libx264", macro_block_size=16)
-    if candidate_grid_rollouts:
-        imageio.mimsave(
-            output_dir / "candidate_grid.mp4",
-            make_candidate_grid_frames(candidate_grid_rollouts),
-            fps=video_fps,
-            codec="libx264",
-            macro_block_size=16,
-        )
-    else:
-        imageio.mimsave(
-            output_dir / "candidate_grid.mp4",
-            [target_frame],
-            fps=video_fps,
-            codec="libx264",
-            macro_block_size=16,
-        )
+    save_run_videos(output_dir, execution_frames, candidate_grid_rollouts, target_frame, video_fps)
     write_metrics_csv(output_dir / "metrics.csv", metrics)
     write_summary_html(
         output_dir / "summary.html",
@@ -359,14 +283,8 @@ def run_oracle_demo(args: argparse.Namespace) -> int:
 
 
 def run_collect_synthetic(args: argparse.Namespace) -> int:
-    assert_python_310()
-    config = load_config(args.config)
-    set_seed(int(args.seed if args.seed is not None else config.get("seed", 43)))
-    device = select_device(config)
-    rng = np.random.default_rng(int(args.seed if args.seed is not None else config.get("seed", 43)))
-    print(f"python: {sys.version.split()[0]}")
-    print(f"torch: {torch.__version__}")
-    print(f"device: {device}")
+    config, device, seed = setup_run(args)
+    rng = np.random.default_rng(seed)
 
     encoder = build_encoder(config, args.require_official_vjepa, device)
     output = Path(args.output).resolve()
@@ -432,15 +350,8 @@ def run_collect_synthetic(args: argparse.Namespace) -> int:
 
 
 def run_collect_latent_shards(args: argparse.Namespace) -> int:
-    assert_python_310()
-    config = load_config(args.config)
-    seed = int(args.seed if args.seed is not None else config.get("seed", 43))
-    set_seed(seed)
-    device = select_device(config)
+    config, device, seed = setup_run(args)
     rng = np.random.default_rng(seed)
-    print(f"python: {sys.version.split()[0]}")
-    print(f"torch: {torch.__version__}")
-    print(f"device: {device}")
 
     encoder = build_encoder(config, args.require_official_vjepa, device).eval()
     for param in encoder.parameters():
@@ -512,15 +423,8 @@ def run_collect_latent_shards(args: argparse.Namespace) -> int:
 
 
 def run_train_ac_latent(args: argparse.Namespace) -> int:
-    assert_python_310()
-    config = load_config(args.config)
-    seed = int(args.seed if args.seed is not None else config.get("seed", 43))
-    set_seed(seed)
-    device = select_device(config)
+    config, device, seed = setup_run(args)
     rng = np.random.default_rng(seed)
-    print(f"python: {sys.version.split()[0]}")
-    print(f"torch: {torch.__version__}")
-    print(f"device: {device}")
 
     predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).train()
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -733,7 +637,7 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
     collector_log = (run_dir / "collector.log").open("w", encoding="utf-8")
     trainer_log = (run_dir / "trainer.log").open("w", encoding="utf-8")
 
-    base = [sys.executable, "main.py"]
+    base = [sys.executable, str(Path(__file__).resolve())]
     collector_cmd = base + [
         "collect-latent-shards",
         "--require-official-vjepa",
@@ -802,13 +706,7 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
 
 
 def run_train_ac(args: argparse.Namespace) -> int:
-    assert_python_310()
-    config = load_config(args.config)
-    set_seed(int(args.seed if args.seed is not None else config.get("seed", 43)))
-    device = select_device(config)
-    print(f"python: {sys.version.split()[0]}")
-    print(f"torch: {torch.__version__}")
-    print(f"device: {device}")
+    config, device, _ = setup_run(args)
 
     encoder = build_encoder(config, args.require_official_vjepa, device)
     encoder.eval()
@@ -820,14 +718,14 @@ def run_train_ac(args: argparse.Namespace) -> int:
         HDF5WindowDataset(args.dataset, "train"),
         batch_size=int(args.batch_size),
         shuffle=True,
-        num_workers=0,
+        num_workers=os.cpu_count() or 0,
         pin_memory=device.type == "cuda",
     )
     val_loader = DataLoader(
         HDF5WindowDataset(args.dataset, "val"),
         batch_size=int(args.batch_size),
         shuffle=False,
-        num_workers=0,
+        num_workers=os.cpu_count() or 0,
         pin_memory=device.type == "cuda",
     )
 
@@ -913,13 +811,7 @@ def run_train_ac(args: argparse.Namespace) -> int:
 
 
 def run_eval_ac(args: argparse.Namespace) -> int:
-    assert_python_310()
-    config = load_config(args.config)
-    set_seed(int(args.seed if args.seed is not None else config.get("seed", 43)))
-    device = select_device(config)
-    print(f"python: {sys.version.split()[0]}")
-    print(f"torch: {torch.__version__}")
-    print(f"device: {device}")
+    config, device, _ = setup_run(args)
 
     encoder = build_encoder(config, args.require_official_vjepa, device)
     predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).eval()
@@ -1018,17 +910,7 @@ def run_eval_ac(args: argparse.Namespace) -> int:
     final_reward = env.compute_reward()
     final_distance = env.distance_to_goal()
     success = final_distance < initial_distance
-    imageio.mimsave(output_dir / "execution.mp4", execution_frames, fps=video_fps, codec="libx264", macro_block_size=16)
-    if candidate_grid_rollouts:
-        imageio.mimsave(
-            output_dir / "candidate_grid.mp4",
-            make_candidate_grid_frames(candidate_grid_rollouts),
-            fps=video_fps,
-            codec="libx264",
-            macro_block_size=16,
-        )
-    else:
-        imageio.mimsave(output_dir / "candidate_grid.mp4", [target_frame], fps=video_fps, codec="libx264", macro_block_size=16)
+    save_run_videos(output_dir, execution_frames, candidate_grid_rollouts, target_frame, video_fps)
     write_metrics_csv(output_dir / "metrics.csv", metrics)
     write_summary_html(
         output_dir / "summary.html",
@@ -1126,7 +1008,7 @@ def _collect_latent_split(
         stop = min(windows, start + shard_size)
         final_path = out_dir / f"{split}-{shard_idx:05d}.h5"
         if resume and _latent_shard_complete(final_path):
-            print(f"{split}: skip completed shard {shard_idx + 1}/{total_shards}")
+            print(f"{split}: 跳过已完成的分片 {shard_idx + 1}/{total_shards}")
             continue
         tmp_path = out_dir / f"{split}-{shard_idx:05d}.tmp.h5"
         if tmp_path.exists():
@@ -1145,7 +1027,7 @@ def _collect_latent_split(
                 before = env.snapshot_signature()
                 result = planner.plan(env, goal_z)
                 if env.snapshot_signature() != before:
-                    raise RuntimeError("Oracle latent-shard planning changed the live environment state.")
+                    raise RuntimeError("Oracle 隐变量分片规划改变了实时环境状态。")
                 action_window = result.best_sequence[:sequence_len]
             else:
                 action_window = _scripted_actions(env, rng, sequence_len, source)
@@ -1155,7 +1037,7 @@ def _collect_latent_split(
             states[local_idx] = state_window.astype(np.float32)
             next_states[local_idx] = next_state_window.astype(np.float32)
             if env.stack_depth != 0:
-                raise RuntimeError("Latent shard collection leaked rollback stack state.")
+                raise RuntimeError("隐变量分片收集导致回滚栈状态泄露。")
 
         z = _encode_frame_windows(
             encoder=encoder,
@@ -1265,7 +1147,7 @@ def _train_latent_shard(
                 )
                 scaled_loss = loss / max(1, grad_accum)
             if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite latent training loss in {shard}: {metrics}")
+                raise RuntimeError(f"在 {shard} 中出现非有限的隐变量训练损失：{metrics}")
             scaler.scale(scaled_loss).backward()
             step += 1
             if step % max(1, grad_accum) == 0 or start + batch_size >= n_items:
@@ -1321,7 +1203,7 @@ def _evaluate_latent_shards(
                         rollout_steps=rollout_steps,
                     )
                 if not torch.isfinite(loss):
-                    raise RuntimeError(f"Non-finite latent validation loss in {shard}: {metrics}")
+                    raise RuntimeError(f"在 {shard} 中出现非有限的隐变量验证损失：{metrics}")
                 for key in totals:
                     totals[key] += metrics[key]
                 count += 1
@@ -1396,7 +1278,7 @@ def _scripted_actions(env, rng: np.random.Generator, sequence_len: int, source: 
             if rng.random() < 0.35:
                 xy += 0.4 * (env.goal_xy - env.get_agent_xy())
         else:
-            raise ValueError(f"Unknown synthetic source: {source}")
+            raise ValueError(f"未知的合成数据源：{source}")
         actions[step, :2] = np.clip(xy, -1.0, 1.0)
     return actions
 
@@ -1452,7 +1334,7 @@ def _run_ac_epoch(
             loss, metrics = compute_ac_predictor_loss(encoder, predictor, frames, actions, states, rollout_steps=rollout_steps)
             scaled_loss = loss / max(1, grad_accum)
         if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite AC training loss: {metrics}")
+            raise RuntimeError(f"AC 训练损失不为有限值：{metrics}")
         scaler.scale(scaled_loss).backward()
         if step % max(1, grad_accum) == 0 or step == len(loader):
             scaler.step(optimizer)
@@ -1481,7 +1363,7 @@ def _evaluate_ac_loss(
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             loss, metrics = compute_ac_predictor_loss(encoder, predictor, frames, actions, states, rollout_steps=rollout_steps)
         if not torch.isfinite(loss):
-            raise RuntimeError(f"Non-finite AC validation loss: {metrics}")
+            raise RuntimeError(f"AC 验证损失不为有限值：{metrics}")
         for key in totals:
             totals[key] += metrics[key]
         count += 1
@@ -1500,192 +1382,6 @@ def _random_latent_baseline(
     costs = planner.evaluate_sequences(z_ctx, goal_z, actions, state0)
     return float(costs.min().detach().cpu())
 
-
-@torch.no_grad()
-def build_goal_latent(env, encoder, device: torch.device, target_steps: int) -> tuple[torch.Tensor, np.ndarray, dict]:
-    env.push_state()
-    try:
-        actions = make_ground_truth_detour_actions(target_steps)
-        summary = env.rollout_sequence(actions, record_frames=False)
-        target_frame = env.render().copy()
-        goal_z = encoder(env.get_frame_tensor(str(device)))[:, -1].detach()
-    finally:
-        env.pop_state()
-    return goal_z, target_frame, summary
-
-
-def make_ground_truth_detour_actions(target_steps: int) -> np.ndarray:
-    target_steps = max(target_steps, 12)
-    phases = [
-        (0.45, np.array([1.0, 0.0], dtype=np.float32)),
-        (0.35, np.array([0.0, 1.0], dtype=np.float32)),
-        (0.20, np.array([-0.25, 0.2], dtype=np.float32)),
-    ]
-    actions: list[np.ndarray] = []
-    allocated = 0
-    for idx, (fraction, xy_action) in enumerate(phases):
-        count = int(round(target_steps * fraction)) if idx < len(phases) - 1 else target_steps - allocated
-        allocated += count
-        for _ in range(max(0, count)):
-            action = np.zeros(7, dtype=np.float32)
-            action[:2] = xy_action
-            actions.append(action)
-    return np.stack(actions, axis=0)
-
-
-@torch.no_grad()
-def evaluate_direct_vs_detour(env, planner: OracleCEMPlanner, goal_z: torch.Tensor, horizon: int) -> dict[str, float]:
-    direct = np.zeros((1, horizon, 7), dtype=np.float32)
-    direct[:, :, 0] = 1.0
-    direct[:, :, 1] = 0.0
-    detour = np.zeros((1, horizon, 7), dtype=np.float32)
-    half = max(1, horizon // 2)
-    detour[:, :half, 0] = 1.0
-    detour[:, :half, 1] = 0.0
-    detour[:, half:, 0] = 0.0
-    detour[:, half:, 1] = 1.0
-    sequences = np.concatenate([direct, detour], axis=0)
-    costs, rewards, xs, ys = planner.evaluate_sequences(env, sequences, goal_z)
-    return {
-        "direct_cost": float(costs[0]),
-        "detour_cost": float(costs[1]),
-        "direct_reward": float(rewards[0]),
-        "detour_reward": float(rewards[1]),
-        "direct_x": float(xs[0]),
-        "direct_y": float(ys[0]),
-        "detour_x": float(xs[1]),
-        "detour_y": float(ys[1]),
-    }
-
-
-def collect_candidate_rollouts(env, sequences: np.ndarray, action_repeat: int) -> list[list[np.ndarray]]:
-    rollouts: list[list[np.ndarray]] = []
-    before = env.snapshot_signature()
-    for sequence in sequences:
-        env.push_state()
-        try:
-            repeated = np.repeat(sequence, action_repeat, axis=0) if action_repeat > 1 else sequence
-            result = env.rollout_sequence(repeated, record_frames=True)
-            rollouts.append(result["frames"])
-        finally:
-            env.pop_state()
-        if env.snapshot_signature() != before:
-            raise RuntimeError("Candidate visualization rollout changed the live environment state.")
-    return rollouts
-
-
-def make_candidate_grid_frames(rollouts: list[list[np.ndarray]]) -> list[np.ndarray]:
-    if not rollouts:
-        return []
-    max_len = max(len(frames) for frames in rollouts)
-    cols = min(2, len(rollouts))
-    rows = int(np.ceil(len(rollouts) / cols))
-    blank = np.zeros_like(rollouts[0][0])
-    grid_frames: list[np.ndarray] = []
-    for frame_idx in range(max_len):
-        tiles = []
-        for rollout in rollouts:
-            tiles.append(rollout[min(frame_idx, len(rollout) - 1)])
-        while len(tiles) < rows * cols:
-            tiles.append(blank)
-        row_imgs = []
-        for row in range(rows):
-            start = row * cols
-            row_imgs.append(np.concatenate(tiles[start : start + cols], axis=1))
-        grid_frames.append(np.concatenate(row_imgs, axis=0))
-    return grid_frames
-
-
-def write_metrics_csv(path: Path, metrics: list[dict[str, float]]) -> None:
-    if not metrics:
-        path.write_text("", encoding="utf-8")
-        return
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(metrics[0].keys()))
-        writer.writeheader()
-        writer.writerows(metrics)
-
-
-def write_summary_html(
-    path: Path,
-    metrics: list[dict[str, float]],
-    initial_x: float,
-    initial_reward: float,
-    final_x: float,
-    final_reward: float,
-    goal_x: float,
-    target_summary: dict,
-) -> None:
-    reward_svg = make_svg_chart(metrics, "reward", "Reward")
-    cost_svg = make_svg_chart(metrics, "latent_cost", "Latent Cost")
-    rows = "\n".join(
-        "<tr>"
-        f"<td>{int(row['step'])}</td>"
-        f"<td>{row['chosen_action0']:+.3f}</td>"
-        f"<td>{row['chosen_action1']:+.3f}</td>"
-        f"<td>{row['x']:.4f}</td>"
-        f"<td>{row['y']:.4f}</td>"
-        f"<td>{row['reward']:.4f}</td>"
-        f"<td>{row['latent_cost']:.6f}</td>"
-        "</tr>"
-        for row in metrics
-    )
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>VJEPA-Gym Oracle Demo</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 24px; color: #1f2933; }}
-    img {{ max-width: 480px; margin-right: 16px; border: 1px solid #d0d7de; }}
-    table {{ border-collapse: collapse; margin-top: 16px; }}
-    th, td {{ border: 1px solid #d0d7de; padding: 6px 10px; text-align: right; }}
-    th {{ background: #f6f8fa; }}
-    .charts {{ display: flex; gap: 16px; flex-wrap: wrap; margin: 16px 0; }}
-  </style>
-</head>
-<body>
-  <h1>VJEPA-Gym Oracle Demo</h1>
-  <p>Initial x={initial_x:.4f}, reward={initial_reward:.4f}; final x={final_x:.4f}, reward={final_reward:.4f}; goal x={goal_x:.4f}.</p>
-  <p>Target image x={target_summary['x']:.4f}, y={target_summary['y']:.4f}, reward={target_summary['reward']:.4f}.</p>
-  <div>
-    <video src="execution.mp4" controls autoplay muted loop width="480"></video>
-    <video src="candidate_grid.mp4" controls autoplay muted loop width="480"></video>
-  </div>
-  <div class="charts">{reward_svg}{cost_svg}</div>
-  <table>
-    <thead><tr><th>step</th><th>action0</th><th>action1</th><th>x</th><th>y</th><th>reward</th><th>latent_cost</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
-</body>
-</html>
-"""
-    path.write_text(html, encoding="utf-8")
-
-
-def make_svg_chart(metrics: list[dict[str, float]], key: str, title: str) -> str:
-    width, height = 360, 180
-    if not metrics:
-        return f"<svg width='{width}' height='{height}'><text x='16' y='24'>{title}: no data</text></svg>"
-    values = np.asarray([row[key] for row in metrics], dtype=np.float64)
-    vmin = float(values.min())
-    vmax = float(values.max())
-    if abs(vmax - vmin) < 1e-9:
-        vmax = vmin + 1.0
-    xs = np.linspace(24, width - 16, num=len(values))
-    ys = height - 28 - ((values - vmin) / (vmax - vmin)) * (height - 56)
-    points = " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
-    return (
-        f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}'>"
-        f"<text x='16' y='20' font-size='14'>{title}</text>"
-        f"<polyline points='{points}' fill='none' stroke='#0969da' stroke-width='2'/>"
-        f"<text x='16' y='{height - 8}' font-size='11'>min={vmin:.4f} max={vmax:.4f}</text>"
-        "</svg>"
-    )
-
-
-def _arg_or_config(value, config: dict, key: str, default):
-    return value if value is not None else config.get(key, default)
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import random
 import sys
 from pathlib import Path
@@ -443,11 +444,19 @@ def _get_free_ram_mb() -> float:
     return 4096.0  # 保守默认：4 GB
 
 
+# 训练小批量对梯度质量的边际收益递减（过大批次可能伤收敛）
+_BATCH_SIZE_CAP:   int = 64
+# 超过此值 GPU 利用率提升有限
+_ENCODE_BATCH_CAP: int = 128
+# 超过此值 DataLoader worker 调度开销超过 I/O 收益
+_NUM_WORKERS_CAP:  int = 8
+
+
 def probe_safe_memory_params(
     device: torch.device,
     batch_size: int,
     grad_accum: int,
-    encode_batch_size: int = 16,
+    encode_batch_size: int = 32,
     num_workers: int = 4,
     *,
     model_vram_mb: float = 1200.0,
@@ -456,21 +465,26 @@ def probe_safe_memory_params(
     ram_headroom_mb: float = 1024.0,
     ram_per_worker_mb: float = 512.0,
 ) -> dict[str, int]:
-    """根据可用显存/内存自动压低参数，防止 OOM。只降不升。
+    """根据可用显存/内存**双向自动调节**参数。
+
+    显存充裕时主动提升 batch_size / encode_batch_size / num_workers，
+    显存不足时则压低它们。有效批量（batch_size × grad_accum）始终保持不变。
 
     VRAM 调节逻辑
     -------------
-    可用预算 = free_vram - vram_headroom - model_vram
-    max_batch_size = max(1, 预算 // per_sample_vram)
-    若 batch_size 被压低，同步上调 grad_accum 使有效批量不变：
-        effective_batch = batch_size × grad_accum（不变）
-        new_grad_accum  = ceil(effective_batch / new_batch_size)
+    可用预算 = free_vram − vram_headroom − model_vram
+    safe_bs    = max(1, 预算 ÷ per_sample_vram)
+    optimal_bs = min(safe_bs, BATCH_SIZE_CAP)
 
-    encode_batch_size 按同一预算的 2× 估算（推理无梯度，显存占用约一半）。
+    若 optimal_bs ≠ batch_size：
+      → grad_accum = max(1, ceil(eff / optimal_bs))  [同步缩放]
+
+    encode_batch_size 按推理预算（×2）独立计算并加上界。
 
     RAM 调节逻辑
     ------------
-    max_workers = max(0, (free_ram - ram_headroom) // ram_per_worker)
+    safe_workers   = (free_ram − ram_headroom) ÷ ram_per_worker
+    optimal_workers = min(safe_workers, cpu_count, NUM_WORKERS_CAP)
     """
     result: dict[str, int] = {
         "batch_size":        batch_size,
@@ -479,49 +493,61 @@ def probe_safe_memory_params(
         "num_workers":       num_workers,
     }
     changed: list[str] = []
+    eff = batch_size * grad_accum  # 有效批量（始终不变）
 
     # ── VRAM ──────────────────────────────────────────────────────────────
     free_vram = _get_free_vram_mb(device)
     if free_vram is not None:
-        budget = max(0.0, free_vram - vram_headroom_mb - model_vram_mb)
-        max_bs = max(1, int(budget / per_sample_vram_mb))
-        if max_bs < batch_size:
-            eff = batch_size * grad_accum          # 有效批量（保持不变）
-            new_bs = max_bs
-            new_ga = max(grad_accum, math.ceil(eff / new_bs))
+        budget     = max(0.0, free_vram - vram_headroom_mb - model_vram_mb)
+        safe_bs    = max(1, int(budget / per_sample_vram_mb))
+        optimal_bs = min(safe_bs, _BATCH_SIZE_CAP)
+
+        if optimal_bs != batch_size:
+            new_ga    = max(1, math.ceil(eff / optimal_bs))
+            direction = "↑扩展" if optimal_bs > batch_size else "↓压低"
             changed.append(
-                f"batch_size {batch_size}→{new_bs}, "
+                f"batch_size {batch_size}→{optimal_bs} {direction}, "
                 f"grad_accum {grad_accum}→{new_ga} "
-                f"(free_vram={free_vram:.0f} MB, budget={budget:.0f} MB)"
+                f"(有效批量={optimal_bs * new_ga}, "
+                f"free_vram={free_vram:.0f} MB, budget={budget:.0f} MB)"
             )
-            result["batch_size"] = new_bs
+            result["batch_size"] = optimal_bs
             result["grad_accum"] = new_ga
-        # encode_batch_size：无梯度，显存约为训练的一半 → 预算 ×2
-        max_enc = max(1, int(budget * 2 / per_sample_vram_mb))
-        if max_enc < encode_batch_size:
-            changed.append(f"encode_batch_size {encode_batch_size}→{max_enc}")
-            result["encode_batch_size"] = max_enc
-    else:
-        free_vram_display = "N/A (CPU)"
+
+        # encode_batch_size：推理无梯度，预算 ×2
+        safe_enc    = max(1, int(budget * 2 / per_sample_vram_mb))
+        optimal_enc = min(safe_enc, _ENCODE_BATCH_CAP)
+        if optimal_enc != encode_batch_size:
+            direction = "↑扩展" if optimal_enc > encode_batch_size else "↓压低"
+            changed.append(f"encode_batch_size {encode_batch_size}→{optimal_enc} ({direction})")
+            result["encode_batch_size"] = optimal_enc
 
     # ── RAM ───────────────────────────────────────────────────────────────
-    free_ram = _get_free_ram_mb()
-    usable_ram = max(0.0, free_ram - ram_headroom_mb)
-    max_workers = max(0, int(usable_ram / ram_per_worker_mb))
-    if max_workers < num_workers:
+    free_ram        = _get_free_ram_mb()
+    usable_ram      = max(0.0, free_ram - ram_headroom_mb)
+    safe_workers    = max(0, int(usable_ram / ram_per_worker_mb))
+    optimal_workers = min(safe_workers, os.cpu_count() or 1, _NUM_WORKERS_CAP)
+    if optimal_workers != num_workers:
+        direction = "↑扩展" if optimal_workers > num_workers else "↓压低"
         changed.append(
-            f"num_workers {num_workers}→{max_workers} "
-            f"(free_ram={free_ram:.0f} MB)"
+            f"num_workers {num_workers}→{optimal_workers} "
+            f"({direction}, free_ram={free_ram:.0f} MB)"
         )
-        result["num_workers"] = max_workers
+        result["num_workers"] = optimal_workers
 
     # ── 报告 ──────────────────────────────────────────────────────────────
-    vram_str = f"{free_vram:.0f} MB" if free_vram is not None else "N/A"
-    if changed:
-        print(f"[auto-tune] 内存不足，参数已自动调节：{'; '.join(changed)}")
-    else:
-        print(
-            f"[auto-tune] 内存充足，参数无需调节 "
-            f"(free_vram={vram_str}, free_ram={free_ram:.0f} MB)"
-        )
+    vram_str  = f"{free_vram:.0f} MB" if free_vram is not None else "N/A"
+    final_bs  = result["batch_size"]
+    final_ga  = result["grad_accum"]
+    final_enc = result["encode_batch_size"]
+    final_wk  = result["num_workers"]
+    status    = "参数已自动调节" if changed else "参数与请求值一致"
+    print(
+        f"[auto-tune] {status} — "
+        f"batch={final_bs} accum={final_ga} eff={final_bs * final_ga} "
+        f"enc_bs={final_enc} workers={final_wk} "
+        f"| free_vram={vram_str} free_ram={free_ram:.0f} MB"
+    )
+    for msg in changed:
+        print(f"  ↳ {msg}")
     return result

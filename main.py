@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -465,6 +466,24 @@ def run_train_ac_latent(args: argparse.Namespace) -> int:
     args.batch_size = _mem["batch_size"]
     args.grad_accum = _mem["grad_accum"]
 
+    # 初始化 W&B（在子进程中必须显式调用，不会继承 notebook 的 run）。
+    _wandb_project = getattr(args, "wandb_project", None)
+    if HAS_WANDB and _wandb_project:
+        wandb.init(
+            project=_wandb_project,
+            name=getattr(args, "wandb_run_name", None) or "train-ac-latent",
+            config={
+                "batch_size":   int(args.batch_size),
+                "grad_accum":   int(args.grad_accum),
+                "lr":           float(args.lr),
+                "weight_decay": float(args.weight_decay),
+                "rollout_steps":int(args.rollout_steps),
+                "amp":          bool(args.amp),
+            },
+            resume="allow",
+        )
+        print(f"[wandb] run 已初始化，project={_wandb_project}")
+
     predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).train()
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     use_amp = bool(args.amp) and device.type == "cuda"
@@ -665,7 +684,36 @@ def run_train_ac_latent(args: argparse.Namespace) -> int:
 
     print(f"checkpoint: {latest_path}")
     print("train-ac-latent: ok")
+    if HAS_WANDB and wandb.run is not None:
+        wandb.finish()
     return 0
+
+
+def _stream_subprocess(
+    proc: subprocess.Popen,
+    log_path: Path,
+    prefix: str,
+) -> threading.Thread:
+    """将子进程 stdout 实时同步写入日志文件 + 当前控制台。
+
+    解决 Colab 中 pipeline-latent 没有任何输出的问题：原先子进程
+    stdout 被完全重定向到文件，用户看不到任何内容。
+    """
+    log_file = log_path.open("w", encoding="utf-8", buffering=1)
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                log_file.write(line)
+                log_file.flush()
+                print(f"[{prefix}] {line}", end="", flush=True)
+        finally:
+            log_file.close()
+
+    t = threading.Thread(target=_reader, daemon=True, name=f"{prefix}-reader")
+    t.start()
+    return t
 
 
 def run_pipeline_latent(args: argparse.Namespace) -> int:
@@ -674,75 +722,99 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     data_dir = Path(args.data_dir).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
-    train_shards = math.ceil(int(args.train_windows) / int(args.shard_size))
-    val_shards = math.ceil(int(args.val_windows) / int(args.shard_size))
-    collector_log = (run_dir / "collector.log").open("w", encoding="utf-8")
-    trainer_log = (run_dir / "trainer.log").open("w", encoding="utf-8")
+    train_shards_expected = math.ceil(int(args.train_windows) / int(args.shard_size))
+    val_shards_expected   = math.ceil(int(args.val_windows)   / int(args.shard_size))
 
     base = [sys.executable, str(Path(__file__).resolve())]
     collector_cmd = base + [
         "collect-latent-shards",
         "--require-official-vjepa",
-        "--output-dir",
-        str(data_dir),
-        "--train-windows",
-        str(args.train_windows),
-        "--val-windows",
-        str(args.val_windows),
-        "--shard-size",
-        str(args.shard_size),
-        "--oracle-candidates",
-        str(args.oracle_candidates),
-        "--oracle-elites",
-        str(args.oracle_elites),
-        "--oracle-iters",
-        str(args.oracle_iters),
-        "--encode-batch-size",
-        str(args.encode_batch_size),
+        "--output-dir",        str(data_dir),
+        "--train-windows",     str(args.train_windows),
+        "--val-windows",       str(args.val_windows),
+        "--shard-size",        str(args.shard_size),
+        "--oracle-candidates", str(args.oracle_candidates),
+        "--oracle-elites",     str(args.oracle_elites),
+        "--oracle-iters",      str(args.oracle_iters),
+        "--encode-batch-size", str(args.encode_batch_size),
     ]
     trainer_cmd = base + [
         "train-ac-latent",
-        "--data-dir",
-        str(data_dir),
-        "--output-dir",
-        str(Path(args.output_dir).resolve()),
+        "--data-dir",              str(data_dir),
+        "--output-dir",            str(Path(args.output_dir).resolve()),
         "--watch",
-        "--expected-train-shards",
-        str(train_shards),
-        "--expected-val-shards",
-        str(val_shards),
+        "--expected-train-shards", str(train_shards_expected),
+        "--expected-val-shards",   str(val_shards_expected),
         "--replay-while-waiting",
-        "--epochs",
-        str(args.final_epochs),
-        "--batch-size",
-        str(args.batch_size),
-        "--grad-accum",
-        str(args.grad_accum),
+        "--epochs",                str(args.final_epochs),
+        "--batch-size",            str(args.batch_size),
+        "--grad-accum",            str(args.grad_accum),
     ]
     if bool(args.condition_on_state):
         trainer_cmd.append("--condition-on-state")
-    print(f"collector log: {collector_log.name}")
-    print(f"trainer log: {trainer_log.name}")
-    collector = subprocess.Popen(collector_cmd, cwd=root, stdout=collector_log, stderr=subprocess.STDOUT)
-    trainer = subprocess.Popen(trainer_cmd, cwd=root, stdout=trainer_log, stderr=subprocess.STDOUT)
+    # 将 W&B 项目名透传给两个子进程，各自独立初始化自己的 wandb run。
+    _wandb_project = getattr(args, "wandb_project", None)
+    if _wandb_project:
+        collector_cmd += ["--wandb-project", _wandb_project, "--wandb-run-name", "collector"]
+        trainer_cmd   += ["--wandb-project", _wandb_project, "--wandb-run-name", "trainer"]
+
+    print(f"[pipeline] 预期分片：train={train_shards_expected}  val={val_shards_expected}")
+    collector_log_path = run_dir / "collector.log"
+    trainer_log_path   = run_dir / "trainer.log"
+    print(f"[pipeline] 日志：{collector_log_path}  /  {trainer_log_path}")
+
+    # 用 PIPE 捕获子进程 stdout，由 _stream_subprocess 线程实时转发到控制台。
+    collector = subprocess.Popen(
+        collector_cmd, cwd=root,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    trainer = subprocess.Popen(
+        trainer_cmd, cwd=root,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
     (run_dir / "collector.pid").write_text(str(collector.pid), encoding="utf-8")
-    (run_dir / "trainer.pid").write_text(str(trainer.pid), encoding="utf-8")
+    (run_dir / "trainer.pid").write_text(str(trainer.pid),   encoding="utf-8")
+    collector_thread = _stream_subprocess(collector, collector_log_path, "collector")
+    trainer_thread   = _stream_subprocess(trainer,   trainer_log_path,   "trainer")
+
     try:
         while True:
             collector_code = collector.poll()
-            trainer_code = trainer.poll()
+            trainer_code   = trainer.poll()
             if collector_code is not None and collector_code != 0:
                 trainer.terminate()
-                raise RuntimeError(f"collector failed with exit code {collector_code}; see {collector_log.name}")
+                raise RuntimeError(
+                    f"collector 失败，exit={collector_code}；"
+                    f"详情见 {collector_log_path}"
+                )
             if trainer_code is not None and trainer_code != 0:
                 collector.terminate()
-                raise RuntimeError(f"trainer failed with exit code {trainer_code}; see {trainer_log.name}")
+                raise RuntimeError(
+                    f"trainer 失败，exit={trainer_code}；"
+                    f"详情见 {trainer_log_path}"
+                )
             if collector_code == 0 and trainer_code == 0:
                 break
+            # 每 10s 打印一次整体状态（分片数 + GPU 占用）。
+            n_train = len(list(data_dir.glob("train-*.h5")))
+            n_val   = len(list(data_dir.glob("val-*.h5")))
+            if torch.cuda.is_available():
+                vram_used = torch.cuda.memory_allocated() / (1024 ** 3)
+                vram_rsv  = torch.cuda.memory_reserved()  / (1024 ** 3)
+                gpu_str = f"GPU alloc={vram_used:.2f}GB rsv={vram_rsv:.2f}GB"
+            else:
+                gpu_str = "GPU=N/A"
+            print(
+                f"[pipeline] shards train={n_train}/{train_shards_expected} "
+                f"val={n_val}/{val_shards_expected}  {gpu_str}",
+                flush=True,
+            )
             time.sleep(10.0)
     finally:
-        collector_log.close()
-        trainer_log.close()
+        collector_thread.join(timeout=5.0)
+        trainer_thread.join(timeout=5.0)
     print("pipeline-latent: ok")
     return 0
 
@@ -1516,24 +1588,26 @@ def build_parser() -> argparse.ArgumentParser:
     collect_latent.add_argument("--val-windows", type=int, default=500)
     collect_latent.add_argument("--sequence-len", type=int, default=2)
     collect_latent.add_argument("--action-repeat", type=int, default=5)
-    collect_latent.add_argument("--target-steps", type=int, default=80)
-    collect_latent.add_argument("--shard-size", type=int, default=64)
+    collect_latent.add_argument("--target-steps", type=int, default=40)   # 原80，生成goal目标的仿真步数
+    collect_latent.add_argument("--shard-size", type=int, default=128)   # 原64，更大shard减少分片开销
     collect_latent.add_argument("--oracle-horizon", type=int)
-    collect_latent.add_argument("--oracle-candidates", type=int, default=8)
-    collect_latent.add_argument("--oracle-elites", type=int, default=2)
+    collect_latent.add_argument("--oracle-candidates", type=int, default=4)  # 原8，CEM候选数少一半规划速度2×
+    collect_latent.add_argument("--oracle-elites", type=int, default=1)      # 原2
     collect_latent.add_argument("--oracle-iters", type=int, default=1)
-    collect_latent.add_argument("--encode-batch-size", type=int, default=16)
+    collect_latent.add_argument("--encode-batch-size", type=int, default=32)  # 原16，GPU利用率↑
     collect_latent.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     collect_latent.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     collect_latent.add_argument("--seed", type=int)
+    collect_latent.add_argument("--wandb-project", default=None, help="W&B 项目名，子进程中显式初始化自己的 run")
+    collect_latent.add_argument("--wandb-run-name", default=None, help="W&B run 名称")
     collect_latent.set_defaults(func=run_collect_latent_shards)
     train_latent = sub.add_parser("train-ac-latent", help="Train the AC predictor from cached latent shards.")
     train_latent.add_argument("--config", default="configs.yaml")
     train_latent.add_argument("--data-dir", default="data/ac_latent_shards")
     train_latent.add_argument("--output-dir", default="runs/ac_train")
     train_latent.add_argument("--epochs", type=int, default=10)
-    train_latent.add_argument("--batch-size", type=int, default=1)
-    train_latent.add_argument("--grad-accum", type=int, default=8)
+    train_latent.add_argument("--batch-size", type=int, default=4)   # 原1，提升GPU每步工作量
+    train_latent.add_argument("--grad-accum", type=int, default=2)   # 原8，有效批量不变=8
     train_latent.add_argument("--lr", type=float, default=1e-4)
     train_latent.add_argument("--weight-decay", type=float, default=0.04)
     train_latent.add_argument("--rollout-steps", type=int, default=2)
@@ -1546,6 +1620,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_latent.add_argument("--condition-on-state", action=argparse.BooleanOptionalAction, default=False)
     train_latent.add_argument("--resume-checkpoint")
     train_latent.add_argument("--seed", type=int)
+    train_latent.add_argument("--wandb-project", default=None, help="W&B 项目名，子进程中显式初始化自己的 run")
+    train_latent.add_argument("--wandb-run-name", default=None, help="W&B run 名称")
     train_latent.set_defaults(func=run_train_ac_latent)
     pipe_latent = sub.add_parser("pipeline-latent", help="Run latent shard collection and training concurrently.")
     pipe_latent.add_argument("--run-dir", default="runs/latent_pipeline")
@@ -1553,15 +1629,16 @@ def build_parser() -> argparse.ArgumentParser:
     pipe_latent.add_argument("--output-dir", default="runs/ac_train")
     pipe_latent.add_argument("--train-windows", type=int, default=5000)
     pipe_latent.add_argument("--val-windows", type=int, default=500)
-    pipe_latent.add_argument("--shard-size", type=int, default=64)
-    pipe_latent.add_argument("--oracle-candidates", type=int, default=8)
-    pipe_latent.add_argument("--oracle-elites", type=int, default=2)
+    pipe_latent.add_argument("--shard-size", type=int, default=128)          # 原64
+    pipe_latent.add_argument("--oracle-candidates", type=int, default=4)     # 原8，规划速度2×
+    pipe_latent.add_argument("--oracle-elites", type=int, default=1)         # 原2
     pipe_latent.add_argument("--oracle-iters", type=int, default=1)
-    pipe_latent.add_argument("--encode-batch-size", type=int, default=16)
+    pipe_latent.add_argument("--encode-batch-size", type=int, default=32)    # 原16
     pipe_latent.add_argument("--final-epochs", type=int, default=4)
-    pipe_latent.add_argument("--batch-size", type=int, default=1)
-    pipe_latent.add_argument("--grad-accum", type=int, default=8)
+    pipe_latent.add_argument("--batch-size", type=int, default=4)            # 原1
+    pipe_latent.add_argument("--grad-accum", type=int, default=2)            # 原8，有效批量=8不变
     pipe_latent.add_argument("--condition-on-state", action=argparse.BooleanOptionalAction, default=False)
+    pipe_latent.add_argument("--wandb-project", default=None, help="W&B 项目名，透传给 collector/trainer 子进程")
     pipe_latent.set_defaults(func=run_pipeline_latent)
     train_ac = sub.add_parser("train-ac", help="Train the action-conditioned latent predictor.")
     train_ac.add_argument("--config", default="configs.yaml")

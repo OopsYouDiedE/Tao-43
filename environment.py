@@ -143,8 +143,8 @@ class RollbackMuJoCoEnv:
             self.get_agent_x(),
             self.get_agent_y(),
             0.08,
-            self.physics.named.data.qvel["slide_x"],
-            self.physics.named.data.qvel["slide_y"],
+            float(self.physics.named.data.qvel["slide_x"]),
+            float(self.physics.named.data.qvel["slide_y"]),
             0.0,
             1.0
         ], dtype=np.float32)

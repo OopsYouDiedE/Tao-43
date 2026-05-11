@@ -1693,8 +1693,8 @@ def build_parser() -> argparse.ArgumentParser:
     pipe_latent.add_argument("--run-dir", default="runs/latent_pipeline")
     pipe_latent.add_argument("--data-dir", default="data/ac_latent_shards")
     pipe_latent.add_argument("--output-dir", default="runs/ac_train")
-    pipe_latent.add_argument("--train-windows", type=int, default=5000)
-    pipe_latent.add_argument("--val-windows", type=int, default=500)
+    pipe_latent.add_argument("--train-windows", type=int, default=1280)
+    pipe_latent.add_argument("--val-windows", type=int, default=128)
     pipe_latent.add_argument("--shard-size", type=int, default=128)          # 原64
     pipe_latent.add_argument("--oracle-candidates", type=int, default=4)     # 原8，规划速度2×
     pipe_latent.add_argument("--oracle-elites", type=int, default=1)         # 原2

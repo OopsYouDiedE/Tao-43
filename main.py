@@ -370,18 +370,27 @@ def run_collect_latent_shards(args: argparse.Namespace) -> int:
     config, device, seed = setup_run(args)
     rng = np.random.default_rng(seed)
 
-    encoder = build_encoder(config, args.require_official_vjepa, device).eval()
-    for param in encoder.parameters():
-        param.requires_grad_(False)
-
     # 根据当前可用显存/内存自动压低 encode_batch_size，防止编码阶段 OOM。
+    # 在 pipeline 并发模式下，collector 会给 trainer 留出显存预算。
+    _pipeline_concurrent = os.environ.get("TAO_LATENT_PIPELINE_CONCURRENT", "0") == "1"
     _mem = probe_safe_memory_params(
         device=device,
         batch_size=1,
         grad_accum=1,
         encode_batch_size=int(args.encode_batch_size),
+        workload="collector",
+        sequence_len=int(args.sequence_len),
+        patches_per_frame=int(config["vjepa"]["patches_per_frame"]),
+        embed_dim=int(config["vjepa"]["embed_dim"]),
+        amp=bool(args.amp),
+        model_vram_mb=1024.0,
+        reserved_vram_mb=12288.0 if _pipeline_concurrent else 0.0,
     )
     args.encode_batch_size = _mem["encode_batch_size"]
+
+    encoder = build_encoder(config, args.require_official_vjepa, device).eval()
+    for param in encoder.parameters():
+        param.requires_grad_(False)
 
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -458,10 +467,20 @@ def run_train_ac_latent(args: argparse.Namespace) -> int:
 
     # 根据当前可用显存/内存自动压低训练参数，防止 OOM。
     # 一次性写回 args，后续所有引用均自动生效。
+    # 在 pipeline 并发模式下，trainer 会给 collector 的 V-JEPA 编码阶段留显存预算。
+    _pipeline_concurrent = os.environ.get("TAO_LATENT_PIPELINE_CONCURRENT", "0") == "1"
     _mem = probe_safe_memory_params(
         device=device,
         batch_size=int(args.batch_size),
         grad_accum=int(args.grad_accum),
+        workload="latent_trainer",
+        predictor_cfg=config["predictor"],
+        sequence_len=int(args.sequence_len),
+        rollout_steps=int(args.rollout_steps),
+        patches_per_frame=int(config["vjepa"]["patches_per_frame"]),
+        embed_dim=int(config["vjepa"]["embed_dim"]),
+        amp=bool(args.amp),
+        reserved_vram_mb=6144.0 if _pipeline_concurrent else 0.0,
     )
     args.batch_size = _mem["batch_size"]
     args.grad_accum = _mem["grad_accum"]
@@ -751,6 +770,7 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
         "--batch-size",            str(args.batch_size),
         "--grad-accum",            str(args.grad_accum),
         "--rollout-steps",         str(args.rollout_steps),
+        "--sequence-len",          str(args.sequence_len),
     ]
     if bool(args.condition_on_state):
         trainer_cmd.append("--condition-on-state")
@@ -766,15 +786,18 @@ def run_pipeline_latent(args: argparse.Namespace) -> int:
     print(f"[pipeline] 日志：{collector_log_path}  /  {trainer_log_path}")
 
     # 用 PIPE 捕获子进程 stdout，由 _stream_subprocess 线程实时转发到控制台。
+    child_env = os.environ.copy()
+    child_env["TAO_LATENT_PIPELINE_CONCURRENT"] = "1"
+
     collector = subprocess.Popen(
         collector_cmd, cwd=root,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
+        text=True, bufsize=1, env=child_env,
     )
     trainer = subprocess.Popen(
         trainer_cmd, cwd=root,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
+        text=True, bufsize=1, env=child_env,
     )
     (run_dir / "collector.pid").write_text(str(collector.pid), encoding="utf-8")
     (run_dir / "trainer.pid").write_text(str(trainer.pid),   encoding="utf-8")
@@ -854,6 +877,13 @@ def run_train_ac(args: argparse.Namespace) -> int:
         batch_size=int(args.batch_size),
         grad_accum=int(args.grad_accum),
         num_workers=min(4, os.cpu_count() or 1),
+        workload="full_trainer",
+        predictor_cfg=config["predictor"],
+        sequence_len=int(args.sequence_len),
+        rollout_steps=int(args.rollout_steps),
+        patches_per_frame=int(config["vjepa"]["patches_per_frame"]),
+        embed_dim=int(config["vjepa"]["embed_dim"]),
+        amp=bool(args.amp),
     )
     args.batch_size = _mem["batch_size"]
     args.grad_accum = _mem["grad_accum"]
@@ -1646,6 +1676,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_latent.add_argument("--lr", type=float, default=1e-4)
     train_latent.add_argument("--weight-decay", type=float, default=0.04)
     train_latent.add_argument("--rollout-steps", type=int, default=4)
+    train_latent.add_argument("--sequence-len", type=int, default=4)
     train_latent.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     train_latent.add_argument("--watch", action="store_true")
     train_latent.add_argument("--expected-train-shards", type=int)
@@ -1688,6 +1719,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_ac.add_argument("--lr", type=float, default=1e-4)
     train_ac.add_argument("--weight-decay", type=float, default=0.04)
     train_ac.add_argument("--rollout-steps", type=int, default=2)
+    train_ac.add_argument("--sequence-len", type=int, default=4)
     train_ac.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     train_ac.add_argument("--seed", type=int)
     train_ac.set_defaults(func=run_train_ac)

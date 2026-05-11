@@ -452,6 +452,101 @@ _ENCODE_BATCH_CAP: int = 128
 _NUM_WORKERS_CAP:  int = 8
 
 
+def _predictor_param_count(cfg: dict | PredictorConfig | None) -> int:
+    """粗略估算 ActionConditionedPredictor 参数量，用于显存预算。"""
+    if isinstance(cfg, PredictorConfig):
+        visual_dim = int(cfg.visual_dim)
+        pred_dim = int(cfg.pred_dim)
+        action_dim = int(cfg.action_dim)
+        state_dim = int(cfg.state_dim)
+        num_layers = int(cfg.num_layers)
+    else:
+        data = cfg or {}
+        visual_dim = int(data.get("visual_dim", 768))
+        pred_dim = int(data.get("pred_dim", 768))
+        action_dim = int(data.get("action_dim", 7))
+        state_dim = int(data.get("state_dim", 7))
+        num_layers = int(data.get("num_layers", 12))
+
+    projections = (visual_dim + action_dim + state_dim) * pred_dim + 3 * pred_dim
+    output = pred_dim * visual_dim + visual_dim
+    temporal = 64 * pred_dim
+    # MultiheadAttention: qkv + out ~= 4*d*d. FFN: d*4d + 4d*d ~= 8*d*d.
+    # Norms and biases are tiny by comparison but included as a small linear term.
+    layer = 12 * pred_dim * pred_dim + 16 * pred_dim
+    return projections + output + temporal + num_layers * layer
+
+
+def _estimate_predictor_static_vram_mb(cfg: dict | PredictorConfig | None) -> float:
+    # fp32 params + grads + AdamW states ~= 16 bytes/param. Add CUDA/module overhead.
+    return max(1024.0, _predictor_param_count(cfg) * 16.0 / (1024.0 ** 2) + 512.0)
+
+
+def _predictor_cfg_value(cfg: dict | PredictorConfig | None, key: str, default: int) -> int:
+    if isinstance(cfg, PredictorConfig):
+        return int(getattr(cfg, key))
+    return int((cfg or {}).get(key, default))
+
+
+def _latent_train_sample_vram_mb(
+    *,
+    predictor_cfg: dict | PredictorConfig | None,
+    sequence_len: int,
+    rollout_steps: int,
+    patches_per_frame: int,
+    amp: bool,
+    include_action_contrast: bool,
+) -> float:
+    """估算 latent trainer 单样本峰值显存。
+
+    这里显式计算 Transformer attention 的 O(T^2) 项。loss 里会跑一次
+    teacher-forcing、若干次 rollout，batch>=2 时还会额外跑一次 action contrast。
+    """
+    pred_dim = _predictor_cfg_value(predictor_cfg, "pred_dim", 768)
+    num_layers = _predictor_cfg_value(predictor_cfg, "num_layers", 12)
+    num_heads = _predictor_cfg_value(predictor_cfg, "num_heads", 12)
+    visual_dim = _predictor_cfg_value(predictor_cfg, "visual_dim", 768)
+    bytes_per_elem = 2.0 if amp else 4.0
+
+    tokens_per_frame = int(patches_per_frame) + 2
+    seq = max(1, int(sequence_len))
+    steps = max(0, min(int(rollout_steps), seq))
+    token_counts = [seq * tokens_per_frame]
+    token_counts.extend((step + 1) * tokens_per_frame for step in range(steps))
+    if include_action_contrast:
+        token_counts.append(seq * tokens_per_frame)
+
+    sum_tokens = float(sum(token_counts))
+    sum_tokens_sq = float(sum(t * t for t in token_counts))
+
+    # Attention score/probability tensors dominate and scale with heads*S^2.
+    attn_mb = num_layers * num_heads * sum_tokens_sq * bytes_per_elem / (1024.0 ** 2)
+    # QKV, FFN, residual/norm, output/loss tensors scale roughly with S*D.
+    hidden_mb = num_layers * sum_tokens * pred_dim * bytes_per_elem * 28.0 / (1024.0 ** 2)
+    io_mb = (seq + 1) * patches_per_frame * visual_dim * 4.0 * 6.0 / (1024.0 ** 2)
+    # Empirical safety factor for PyTorch TransformerEncoder backward workspaces.
+    return (attn_mb * 1.15) + hidden_mb + io_mb + 256.0
+
+
+def _collector_window_vram_mb(
+    *,
+    sequence_len: int,
+    patches_per_frame: int,
+    embed_dim: int,
+    amp: bool,
+) -> float:
+    """估算 collector 每个 window 编码时的推理显存。"""
+    bytes_per_elem = 2.0 if amp else 4.0
+    frames = max(1, int(sequence_len) + 1)
+    tokens = max(1, int(patches_per_frame))
+    dim = max(1, int(embed_dim))
+    # V-JEPA inference has no backward graph, but hub models still allocate
+    # attention/MLP workspaces. Keep this conservative under concurrent training.
+    token_mb = frames * tokens * dim * bytes_per_elem * 18.0 / (1024.0 ** 2)
+    image_mb = frames * 3 * 384 * 384 * 4.0 * 3.0 / (1024.0 ** 2)
+    return max(768.0, token_mb + image_mb)
+
+
 def probe_safe_memory_params(
     device: torch.device,
     batch_size: int,
@@ -459,27 +554,37 @@ def probe_safe_memory_params(
     encode_batch_size: int = 32,
     num_workers: int = 4,
     *,
-    model_vram_mb: float = 2048.0,      # V-JEPA + Predictor 模型自身显存
-    per_sample_vram_mb: float = 400.0,  # 单个样本的梯度显存占用（随着 seq=4 和 rollout=4 大幅增加）
-    vram_headroom_mb: float = 3072.0,   # 预留余量：极其重要！必须为同时运行的 Collector 子进程预留足够空间
+    workload: str = "generic",
+    predictor_cfg: dict | PredictorConfig | None = None,
+    sequence_len: int = 4,
+    rollout_steps: int = 4,
+    patches_per_frame: int = 576,
+    embed_dim: int = 768,
+    amp: bool = True,
+    allow_batch_growth: bool = False,
+    model_vram_mb: float | None = None,
+    per_sample_vram_mb: float | None = None,
+    vram_headroom_mb: float = 2048.0,
+    reserved_vram_mb: float = 0.0,
     ram_headroom_mb: float = 1024.0,
     ram_per_worker_mb: float = 512.0,
 ) -> dict[str, int]:
     """根据可用显存/内存**双向自动调节**参数。
 
-    显存充裕时主动提升 batch_size / encode_batch_size / num_workers，
-    显存不足时则压低它们。有效批量（batch_size × grad_accum）始终保持不变。
+    根据 workload 估算 batch_size / encode_batch_size / num_workers。
+    默认只在危险时压低 batch_size，不主动放大；有效批量
+    （batch_size × grad_accum）通过 grad_accum 尽量保持不变。
 
     VRAM 调节逻辑
     -------------
-    可用预算 = free_vram − vram_headroom − model_vram
-    safe_bs    = max(1, 预算 ÷ per_sample_vram)
+    可用预算 = free_vram − vram_headroom − reserved_vram − model_vram
+    safe_bs    = max(1, 预算 ÷ 估算单样本显存)
     optimal_bs = min(safe_bs, BATCH_SIZE_CAP)
 
     若 optimal_bs ≠ batch_size：
       → grad_accum = max(1, ceil(eff / optimal_bs))  [同步缩放]
 
-    encode_batch_size 按推理预算（×2）独立计算并加上界。
+    encode_batch_size 按 collector 的每 window 推理显存独立计算并加上界。
 
     RAM 调节逻辑
     ------------
@@ -495,12 +600,62 @@ def probe_safe_memory_params(
     changed: list[str] = []
     eff = batch_size * grad_accum  # 有效批量（始终不变）
 
+    if model_vram_mb is None:
+        if workload in {"latent_trainer", "trainer", "full_trainer"}:
+            estimated_model_vram = _estimate_predictor_static_vram_mb(predictor_cfg)
+        else:
+            estimated_model_vram = 1024.0
+    else:
+        estimated_model_vram = float(model_vram_mb)
+
+    def _candidate_sample_mb(candidate_bs: int) -> float:
+        if per_sample_vram_mb is not None:
+            return float(per_sample_vram_mb)
+        if workload in {"latent_trainer", "trainer"}:
+            return _latent_train_sample_vram_mb(
+                predictor_cfg=predictor_cfg,
+                sequence_len=sequence_len,
+                rollout_steps=rollout_steps,
+                patches_per_frame=patches_per_frame,
+                amp=amp and device.type == "cuda",
+                include_action_contrast=candidate_bs >= 2,
+            )
+        if workload == "full_trainer":
+            # Full trainer additionally runs V-JEPA forward before the predictor.
+            return _latent_train_sample_vram_mb(
+                predictor_cfg=predictor_cfg,
+                sequence_len=sequence_len,
+                rollout_steps=rollout_steps,
+                patches_per_frame=patches_per_frame,
+                amp=amp and device.type == "cuda",
+                include_action_contrast=False,
+            ) + _collector_window_vram_mb(
+                sequence_len=sequence_len,
+                patches_per_frame=patches_per_frame,
+                embed_dim=embed_dim,
+                amp=amp and device.type == "cuda",
+            )
+        return 400.0
+
     # ── VRAM ──────────────────────────────────────────────────────────────
     free_vram = _get_free_vram_mb(device)
     if free_vram is not None:
-        budget     = max(0.0, free_vram - vram_headroom_mb - model_vram_mb)
-        safe_bs    = max(1, int(budget / per_sample_vram_mb))
-        optimal_bs = min(safe_bs, _BATCH_SIZE_CAP)
+        budget = max(0.0, free_vram - vram_headroom_mb - reserved_vram_mb - estimated_model_vram)
+        max_candidate = _BATCH_SIZE_CAP if allow_batch_growth else max(1, int(batch_size))
+        optimal_bs = 1
+        estimated_sample_mb = _candidate_sample_mb(1)
+        for candidate in range(1, max_candidate + 1):
+            candidate_sample_mb = _candidate_sample_mb(candidate)
+            if candidate * candidate_sample_mb <= budget:
+                optimal_bs = candidate
+                estimated_sample_mb = candidate_sample_mb
+            else:
+                break
+        if budget < estimated_sample_mb:
+            changed.append(
+                f"warning: batch_size=1 估算仍可能超过预算 "
+                f"(budget={budget:.0f} MB, est_sample={estimated_sample_mb:.0f} MB)"
+            )
 
         if optimal_bs != batch_size:
             new_ga    = max(1, math.ceil(eff / optimal_bs))
@@ -509,17 +664,27 @@ def probe_safe_memory_params(
                 f"batch_size {batch_size}→{optimal_bs} {direction}, "
                 f"grad_accum {grad_accum}→{new_ga} "
                 f"(有效批量={optimal_bs * new_ga}, "
-                f"free_vram={free_vram:.0f} MB, budget={budget:.0f} MB)"
+                f"free_vram={free_vram:.0f} MB, budget={budget:.0f} MB, "
+                f"est_sample={estimated_sample_mb:.0f} MB)"
             )
             result["batch_size"] = optimal_bs
             result["grad_accum"] = new_ga
 
-        # encode_batch_size：推理无梯度，预算 ×2
-        safe_enc    = max(1, int(budget * 2 / per_sample_vram_mb))
-        optimal_enc = min(safe_enc, _ENCODE_BATCH_CAP)
+        enc_sample_mb = _collector_window_vram_mb(
+            sequence_len=sequence_len,
+            patches_per_frame=patches_per_frame,
+            embed_dim=embed_dim,
+            amp=amp and device.type == "cuda",
+        )
+        safe_enc = max(1, int(budget / enc_sample_mb))
+        enc_cap = _ENCODE_BATCH_CAP if allow_batch_growth else max(1, int(encode_batch_size))
+        optimal_enc = min(safe_enc, enc_cap)
         if optimal_enc != encode_batch_size:
             direction = "↑扩展" if optimal_enc > encode_batch_size else "↓压低"
-            changed.append(f"encode_batch_size {encode_batch_size}→{optimal_enc} ({direction})")
+            changed.append(
+                f"encode_batch_size {encode_batch_size}→{optimal_enc} "
+                f"({direction}, est_window={enc_sample_mb:.0f} MB)"
+            )
             result["encode_batch_size"] = optimal_enc
 
     # ── RAM ───────────────────────────────────────────────────────────────
@@ -544,9 +709,11 @@ def probe_safe_memory_params(
     status    = "参数已自动调节" if changed else "参数与请求值一致"
     print(
         f"[auto-tune] {status} — "
+        f"workload={workload} "
         f"batch={final_bs} accum={final_ga} eff={final_bs * final_ga} "
         f"enc_bs={final_enc} workers={final_wk} "
-        f"| free_vram={vram_str} free_ram={free_ram:.0f} MB"
+        f"| free_vram={vram_str} reserved_vram={reserved_vram_mb:.0f} MB "
+        f"model_vram={estimated_model_vram:.0f} MB free_ram={free_ram:.0f} MB"
     )
     for msg in changed:
         print(f"  ↳ {msg}")

@@ -48,10 +48,10 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def assert_python_310() -> None:
-    if sys.version_info[:2] != (3, 10):
+def assert_python_compatible() -> None:
+    if sys.version_info[:2] < (3, 10):
         version = ".".join(map(str, sys.version_info[:3]))
-        raise RuntimeError(f"验证程序必须在 Python 3.10 上运行，当前 Python 版本为 {version}。")
+        raise RuntimeError(f"验证程序必须在 Python 3.10 或更高版本上运行，当前 Python 版本为 {version}。")
 
 
 def setup_run(args: argparse.Namespace) -> tuple[dict, torch.device, int]:
@@ -59,7 +59,7 @@ def setup_run(args: argparse.Namespace) -> tuple[dict, torch.device, int]:
 
     替换了重复的 5 行代码块：
 
-        assert_python_310()
+        assert_python_compatible()
         config = load_config(args.config)
         set_seed(...)
         device = select_device(config)
@@ -67,7 +67,7 @@ def setup_run(args: argparse.Namespace) -> tuple[dict, torch.device, int]:
 
     返回 (config, device, seed)。
     """
-    assert_python_310()
+    assert_python_compatible()
     config = load_config(args.config)
     seed = int(getattr(args, "seed", None) or config.get("seed", 43))
     set_seed(seed)

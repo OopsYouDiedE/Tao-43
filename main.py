@@ -16,6 +16,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+
+
 from core_models import ActionConditionedPredictor, TOKENS_PER_FRAME, mean_patch_cost
 from environment import make_smoke_env
 from latent_planner import LatentCEMPlanner, OracleCEMPlanner, oracle_cem_config_from_dict, cem_config_from_dict
@@ -33,11 +40,16 @@ from utils import (
     save_run_videos,
     write_metrics_csv,
     write_summary_html,
+    probe_safe_memory_params,
 )
 
 
 
 
+# ==============================================================================
+# [SECTION 1] EVALUATION & DEMO COMMANDS
+# 包含：运行验证 (verify)、完美模拟器基准测试 (oracle-demo)
+# ==============================================================================
 def run_verify(args: argparse.Namespace) -> int:
     config, device, _ = setup_run(args)
     vjepa_cfg = config["vjepa"]
@@ -282,6 +294,10 @@ def run_oracle_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+# ==============================================================================
+# [SECTION 2] DATA COLLECTION COMMANDS
+# 包含：收集 HDF5 离线数据集 (collect-synthetic)、收集潜在分片数据 (collect-latent-shards)
+# ==============================================================================
 def run_collect_synthetic(args: argparse.Namespace) -> int:
     config, device, seed = setup_run(args)
     rng = np.random.default_rng(seed)
@@ -357,6 +373,15 @@ def run_collect_latent_shards(args: argparse.Namespace) -> int:
     for param in encoder.parameters():
         param.requires_grad_(False)
 
+    # 根据当前可用显存/内存自动压低 encode_batch_size，防止编码阶段 OOM。
+    _mem = probe_safe_memory_params(
+        device=device,
+        batch_size=1,
+        grad_accum=1,
+        encode_batch_size=int(args.encode_batch_size),
+    )
+    args.encode_batch_size = _mem["encode_batch_size"]
+
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     demo_cfg = dict(config.get("oracle_demo", {}))
@@ -422,9 +447,23 @@ def run_collect_latent_shards(args: argparse.Namespace) -> int:
     return 0
 
 
+# ==============================================================================
+# [SECTION 3] TRAINING & PIPELINE COMMANDS
+# 包含：训练潜在预测器 (train-ac-latent)、端到端流水线调度 (pipeline-latent)
+# ==============================================================================
 def run_train_ac_latent(args: argparse.Namespace) -> int:
     config, device, seed = setup_run(args)
     rng = np.random.default_rng(seed)
+
+    # 根据当前可用显存/内存自动压低训练参数，防止 OOM。
+    # 一次性写回 args，后续所有引用均自动生效。
+    _mem = probe_safe_memory_params(
+        device=device,
+        batch_size=int(args.batch_size),
+        grad_accum=int(args.grad_accum),
+    )
+    args.batch_size = _mem["batch_size"]
+    args.grad_accum = _mem["grad_accum"]
 
     predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).train()
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -504,6 +543,8 @@ def run_train_ac_latent(args: argparse.Namespace) -> int:
                     writer.writerow(row)
                     handle.flush()
                     history.append(row)
+                    if HAS_WANDB and wandb.run is not None:
+                        wandb.log({f"watch_train/{k}": v for k, v in row.items() if isinstance(v, (int, float))})
                     _save_latent_checkpoint(latest_path, predictor, optimizer, config, args, history)
                     print(
                         f"watch shard={shard.name} loss={row['loss']:.6f} "
@@ -600,20 +641,21 @@ def run_train_ac_latent(args: argparse.Namespace) -> int:
                 "loss_action_contrast": train_metrics["loss_action_contrast"],
             }
             writer.writerow(row)
-            writer.writerow(
-                {
-                    "phase": "val",
-                    "index": float(epoch),
-                    "shards": float(len(val_shards)),
-                    "loss": val_metrics["loss_total"],
-                    "loss_tf": val_metrics["loss_tf"],
-                    "loss_roll": val_metrics["loss_roll"],
-                    "loss_delta": val_metrics["loss_delta"],
-                    "loss_delta_roll": val_metrics["loss_delta_roll"],
-                    "loss_action_contrast": val_metrics["loss_action_contrast"],
-                }
-            )
+            val_row = {
+                "phase": "val",
+                "index": float(epoch),
+                "shards": float(len(val_shards)),
+                "loss": val_metrics["loss_total"],
+                "loss_tf": val_metrics["loss_tf"],
+                "loss_roll": val_metrics["loss_roll"],
+                "loss_delta": val_metrics["loss_delta"],
+                "loss_delta_roll": val_metrics["loss_delta_roll"],
+                "loss_action_contrast": val_metrics["loss_action_contrast"],
+            }
+            writer.writerow(val_row)
             handle.flush()
+            if HAS_WANDB and wandb.run is not None:
+                wandb.log({f"epoch_train/{k}": v for k, v in row.items() if isinstance(v, (int, float))} | {f"epoch_val/{k}": v for k, v in val_row.items() if isinstance(v, (int, float))}, step=epoch)
             history.extend([row, {"phase": "val", "index": float(epoch), **val_metrics}])
             _save_latent_checkpoint(latest_path, predictor, optimizer, config, args, history)
             print(
@@ -713,20 +755,35 @@ def run_train_ac(args: argparse.Namespace) -> int:
     for param in encoder.parameters():
         param.requires_grad_(False)
 
+    # 根据当前可用显存/内存自动调节训练参数。
+    _mem = probe_safe_memory_params(
+        device=device,
+        batch_size=int(args.batch_size),
+        grad_accum=int(args.grad_accum),
+        num_workers=min(4, os.cpu_count() or 1),
+    )
+    args.batch_size = _mem["batch_size"]
+    args.grad_accum = _mem["grad_accum"]
+    _num_workers = _mem["num_workers"]
+
     predictor = ActionConditionedPredictor(predictor_config_from_dict(config["predictor"])).to(device).train()
     train_loader = DataLoader(
         HDF5WindowDataset(args.dataset, "train"),
         batch_size=int(args.batch_size),
         shuffle=True,
-        num_workers=os.cpu_count() or 0,
+        num_workers=_num_workers,
         pin_memory=device.type == "cuda",
+        prefetch_factor=2 if _num_workers > 0 else None,
+        persistent_workers=_num_workers > 0,
     )
     val_loader = DataLoader(
         HDF5WindowDataset(args.dataset, "val"),
         batch_size=int(args.batch_size),
         shuffle=False,
-        num_workers=os.cpu_count() or 0,
+        num_workers=_num_workers,
         pin_memory=device.type == "cuda",
+        prefetch_factor=2 if _num_workers > 0 else None,
+        persistent_workers=_num_workers > 0,
     )
 
     output_dir = Path(args.output_dir).resolve()
@@ -810,6 +867,10 @@ def run_train_ac(args: argparse.Namespace) -> int:
     return 0
 
 
+# ==============================================================================
+# [SECTION 4] EVALUATION (LATENT PREDICTOR)
+# 包含：评估训练好的神经网络预测器效果 (eval-ac)
+# ==============================================================================
 def run_eval_ac(args: argparse.Namespace) -> int:
     config, device, _ = setup_run(args)
 
@@ -929,6 +990,9 @@ def run_eval_ac(args: argparse.Namespace) -> int:
     return 0
 
 
+# ==============================================================================
+# [SECTION 5] INTERNAL HELPERS (DATA COLLECTION)
+# ==============================================================================
 def _collect_synthetic_split(
     h5: h5py.File,
     split: str,
@@ -1100,6 +1164,9 @@ def _list_complete_latent_shards(data_dir: Path, split: str) -> list[Path]:
     return [path for path in sorted(data_dir.glob(f"{split}-*.h5")) if _latent_shard_complete(path)]
 
 
+# ==============================================================================
+# [SECTION 6] INTERNAL HELPERS (TRAINING)
+# ==============================================================================
 def _train_latent_shard(
     predictor: ActionConditionedPredictor,
     optimizer: torch.optim.Optimizer,
@@ -1124,42 +1191,50 @@ def _train_latent_shard(
     }
     count = 0
     optimizer.zero_grad(set_to_none=True)
+
+    # 将整个 shard 预加载到 RAM，关闭文件后再训练。
+    # 这消除了训练循环内的所有磁盘 I/O：原先的随机索引会导致 HDF5 非连续小块读，
+    # 现在均为内存切片， GPU 干活期间 CPU 无需等待 I/O。
     with h5py.File(shard, "r") as h5:
         n_items = int(h5["z"].shape[0])
-        order = np.arange(n_items)
-        rng.shuffle(order)
-        step = 0
-        for start in range(0, n_items, batch_size):
-            idx = np.sort(order[start : start + batch_size])
-            z = torch.from_numpy(h5["z"][idx].astype(np.float32)).to(device, non_blocking=True)
-            actions = torch.from_numpy(h5["actions"][idx].astype(np.float32)).to(device, non_blocking=True)
-            if condition_on_state:
-                states = torch.from_numpy(h5["states"][idx].astype(np.float32)).to(device, non_blocking=True)
-            else:
-                states = torch.zeros_like(actions)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                loss, metrics = compute_ac_predictor_latent_loss(
-                    predictor,
-                    z,
-                    actions,
-                    states,
-                    rollout_steps=rollout_steps,
-                )
-                scaled_loss = loss / max(1, grad_accum)
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"在 {shard} 中出现非有限的隐变量训练损失：{metrics}")
-            scaler.scale(scaled_loss).backward()
-            step += 1
-            if step % max(1, grad_accum) == 0 or start + batch_size >= n_items:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-            for key in totals:
-                totals[key] += metrics[key]
-            count += 1
-            del z, actions, states, loss
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        z_all: np.ndarray = h5["z"][:]               # float16 [N, T+1, 576, 768]
+        actions_all: np.ndarray = h5["actions"][:].astype(np.float32)
+        states_all: np.ndarray = h5["states"][:].astype(np.float32) if condition_on_state else None
+
+    order = rng.permutation(n_items)
+    step = 0
+    for start in range(0, n_items, batch_size):
+        idx = order[start : start + batch_size]
+        # 内存切片 + float16→float32，再 non_blocking 传输到 GPU。
+        z = torch.from_numpy(z_all[idx].astype(np.float32)).to(device, non_blocking=True)
+        actions = torch.from_numpy(actions_all[idx]).to(device, non_blocking=True)
+        if condition_on_state and states_all is not None:
+            states = torch.from_numpy(states_all[idx]).to(device, non_blocking=True)
+        else:
+            states = torch.zeros_like(actions)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            loss, metrics = compute_ac_predictor_latent_loss(
+                predictor,
+                z,
+                actions,
+                states,
+                rollout_steps=rollout_steps,
+            )
+            scaled_loss = loss / max(1, grad_accum)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"在 {shard} 中出现非有限的隐变量训练损失：{metrics}")
+        scaler.scale(scaled_loss).backward()
+        step += 1
+        if step % max(1, grad_accum) == 0 or start + batch_size >= n_items:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        for key in totals:
+            totals[key] += metrics[key]
+        count += 1
+        del z, actions, states, loss
+    # 不在每个 shard 后调用 empty_cache：PyTorch 的 CUDA 内存分配器会自动管理
+    # 缓存块，强制清空反而会导致下一个 shard 开始时重新分配碎片内存。
     return {key: value / max(1, count) for key, value in totals.items()}
 
 
@@ -1184,30 +1259,34 @@ def _evaluate_latent_shards(
     }
     count = 0
     for shard in shards:
+        # 预加载整个 shard 到 RAM，关闭文件后再推理，消除推理循环中的磁盘 I/O。
         with h5py.File(shard, "r") as h5:
             n_items = int(h5["z"].shape[0])
-            for start in range(0, n_items, batch_size):
-                slc = slice(start, min(n_items, start + batch_size))
-                z = torch.from_numpy(h5["z"][slc].astype(np.float32)).to(device, non_blocking=True)
-                actions = torch.from_numpy(h5["actions"][slc].astype(np.float32)).to(device, non_blocking=True)
-                if condition_on_state:
-                    states = torch.from_numpy(h5["states"][slc].astype(np.float32)).to(device, non_blocking=True)
-                else:
-                    states = torch.zeros_like(actions)
-                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                    loss, metrics = compute_ac_predictor_latent_loss(
-                        predictor,
-                        z,
-                        actions,
-                        states,
-                        rollout_steps=rollout_steps,
-                    )
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"在 {shard} 中出现非有限的隐变量验证损失：{metrics}")
-                for key in totals:
-                    totals[key] += metrics[key]
-                count += 1
-                del z, actions, states, loss
+            z_all: np.ndarray = h5["z"][:]           # float16
+            actions_all: np.ndarray = h5["actions"][:].astype(np.float32)
+            states_all: np.ndarray = h5["states"][:].astype(np.float32) if condition_on_state else None
+        for start in range(0, n_items, batch_size):
+            slc = slice(start, min(n_items, start + batch_size))
+            z = torch.from_numpy(z_all[slc].astype(np.float32)).to(device, non_blocking=True)
+            actions = torch.from_numpy(actions_all[slc]).to(device, non_blocking=True)
+            if condition_on_state and states_all is not None:
+                states = torch.from_numpy(states_all[slc]).to(device, non_blocking=True)
+            else:
+                states = torch.zeros_like(actions)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                loss, metrics = compute_ac_predictor_latent_loss(
+                    predictor,
+                    z,
+                    actions,
+                    states,
+                    rollout_steps=rollout_steps,
+                )
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"在 {shard} 中出现非有限的隐变量验证损失：{metrics}")
+            for key in totals:
+                totals[key] += metrics[key]
+            count += 1
+            del z, actions, states, loss
     return {key: value / max(1, count) for key, value in totals.items()}
 
 
@@ -1233,6 +1312,9 @@ def _save_latent_checkpoint(
     )
 
 
+# ==============================================================================
+# [SECTION 7] INTERNAL HELPERS (UTILITIES)
+# ==============================================================================
 def _serializable_args(args: argparse.Namespace) -> dict:
     data = {}
     for key, value in vars(args).items():
@@ -1384,6 +1466,9 @@ def _random_latent_baseline(
 
 
 
+# ==============================================================================
+# [SECTION 8] CLI PARSER & MAIN ENTRYPOINT
+# ==============================================================================
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="VJEPA-Gym six-file prototype.")
     sub = parser.add_subparsers(dest="command", required=True)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import random
 import sys
 from pathlib import Path
@@ -382,3 +383,145 @@ def make_svg_chart(metrics: list[dict[str, float]], key: str, title: str) -> str
         f"<text x='16' y='{height - 8}' font-size='11'>min={vmin:.4f} max={vmax:.4f}</text>"
         "</svg>"
     )
+
+
+# ---------------------------------------------------------------------------
+# 内存感知参数自动调节
+# ---------------------------------------------------------------------------
+
+def _get_free_vram_mb(device: torch.device) -> float | None:
+    """返回 CUDA 设备当前可用显存（MB）；非 CUDA 设备返回 None。"""
+    if device.type != "cuda":
+        return None
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        return free_bytes / (1024.0 ** 2)
+    except Exception:
+        return None
+
+
+def _get_free_ram_mb() -> float:
+    """返回系统当前可用内存（MB）；检测失败则返回保守默认值 4096.0。"""
+    # 优先 psutil（跨平台、最精确）
+    try:
+        import psutil  # type: ignore[import]
+        return psutil.virtual_memory().available / (1024.0 ** 2)
+    except ImportError:
+        pass
+    # Linux: /proc/meminfo
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as _f:
+            for _line in _f:
+                if _line.startswith("MemAvailable:"):
+                    return float(_line.split()[1]) / 1024.0  # kB → MB
+    except OSError:
+        pass
+    # Windows: GlobalMemoryStatusEx via ctypes
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class _MEMSTATEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength",                ctypes.c_ulong),
+                ("dwMemoryLoad",            ctypes.c_ulong),
+                ("ullTotalPhys",            ctypes.c_ulonglong),
+                ("ullAvailPhys",            ctypes.c_ulonglong),
+                ("ullTotalPageFile",        ctypes.c_ulonglong),
+                ("ullAvailPageFile",        ctypes.c_ulonglong),
+                ("ullTotalVirtual",         ctypes.c_ulonglong),
+                ("ullAvailVirtual",         ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        _stat = _MEMSTATEX()
+        _stat.dwLength = ctypes.sizeof(_stat)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(_stat))  # type: ignore[attr-defined]
+        return float(_stat.ullAvailPhys) / (1024.0 ** 2)
+    except Exception:
+        pass
+    return 4096.0  # 保守默认：4 GB
+
+
+def probe_safe_memory_params(
+    device: torch.device,
+    batch_size: int,
+    grad_accum: int,
+    encode_batch_size: int = 16,
+    num_workers: int = 4,
+    *,
+    model_vram_mb: float = 1200.0,
+    per_sample_vram_mb: float = 150.0,
+    vram_headroom_mb: float = 512.0,
+    ram_headroom_mb: float = 1024.0,
+    ram_per_worker_mb: float = 512.0,
+) -> dict[str, int]:
+    """根据可用显存/内存自动压低参数，防止 OOM。只降不升。
+
+    VRAM 调节逻辑
+    -------------
+    可用预算 = free_vram - vram_headroom - model_vram
+    max_batch_size = max(1, 预算 // per_sample_vram)
+    若 batch_size 被压低，同步上调 grad_accum 使有效批量不变：
+        effective_batch = batch_size × grad_accum（不变）
+        new_grad_accum  = ceil(effective_batch / new_batch_size)
+
+    encode_batch_size 按同一预算的 2× 估算（推理无梯度，显存占用约一半）。
+
+    RAM 调节逻辑
+    ------------
+    max_workers = max(0, (free_ram - ram_headroom) // ram_per_worker)
+    """
+    result: dict[str, int] = {
+        "batch_size":        batch_size,
+        "grad_accum":        grad_accum,
+        "encode_batch_size": encode_batch_size,
+        "num_workers":       num_workers,
+    }
+    changed: list[str] = []
+
+    # ── VRAM ──────────────────────────────────────────────────────────────
+    free_vram = _get_free_vram_mb(device)
+    if free_vram is not None:
+        budget = max(0.0, free_vram - vram_headroom_mb - model_vram_mb)
+        max_bs = max(1, int(budget / per_sample_vram_mb))
+        if max_bs < batch_size:
+            eff = batch_size * grad_accum          # 有效批量（保持不变）
+            new_bs = max_bs
+            new_ga = max(grad_accum, math.ceil(eff / new_bs))
+            changed.append(
+                f"batch_size {batch_size}→{new_bs}, "
+                f"grad_accum {grad_accum}→{new_ga} "
+                f"(free_vram={free_vram:.0f} MB, budget={budget:.0f} MB)"
+            )
+            result["batch_size"] = new_bs
+            result["grad_accum"] = new_ga
+        # encode_batch_size：无梯度，显存约为训练的一半 → 预算 ×2
+        max_enc = max(1, int(budget * 2 / per_sample_vram_mb))
+        if max_enc < encode_batch_size:
+            changed.append(f"encode_batch_size {encode_batch_size}→{max_enc}")
+            result["encode_batch_size"] = max_enc
+    else:
+        free_vram_display = "N/A (CPU)"
+
+    # ── RAM ───────────────────────────────────────────────────────────────
+    free_ram = _get_free_ram_mb()
+    usable_ram = max(0.0, free_ram - ram_headroom_mb)
+    max_workers = max(0, int(usable_ram / ram_per_worker_mb))
+    if max_workers < num_workers:
+        changed.append(
+            f"num_workers {num_workers}→{max_workers} "
+            f"(free_ram={free_ram:.0f} MB)"
+        )
+        result["num_workers"] = max_workers
+
+    # ── 报告 ──────────────────────────────────────────────────────────────
+    vram_str = f"{free_vram:.0f} MB" if free_vram is not None else "N/A"
+    if changed:
+        print(f"[auto-tune] 内存不足，参数已自动调节：{'; '.join(changed)}")
+    else:
+        print(
+            f"[auto-tune] 内存充足，参数无需调节 "
+            f"(free_vram={vram_str}, free_ram={free_ram:.0f} MB)"
+        )
+    return result

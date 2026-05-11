@@ -15,6 +15,9 @@ from core_models import ActionConditionedPredictor
 
 
 class HDF5EpisodeDataset(Dataset):
+    """单 episode HDF5 数据集：在 __init__ 中一次性将数据预加载到 RAM，
+    消除 __getitem__ 中重复开关 HDF5 文件的 I/O 阻塞。"""
+
     def __init__(self, path: str | Path, sequence_len: int) -> None:
         self.path = Path(path)
         self.sequence_len = sequence_len
@@ -26,26 +29,35 @@ class HDF5EpisodeDataset(Dataset):
                 raise ValueError("actions 必须是 [Episode_Len - 1, 7]。")
             if h5["states"].shape != (self.length - 1, 7):
                 raise ValueError("states 必须是 [Episode_Len - 1, 7]。")
-        if self.length < sequence_len + 1:
-            raise ValueError("Episode 长度小于请求的序列长度。")
+            if self.length < sequence_len + 1:
+                raise ValueError("Episode 长度小于请求的序列长度。")
+            # 一次性预加载到 RAM，后续 __getitem__ 走内存切片，无文件 I/O。
+            self._frames: np.ndarray = h5["frames"][:]          # uint8 [L, 384, 384, 3]
+            self._actions: np.ndarray = h5["actions"][:].astype(np.float32)
+            self._states: np.ndarray = h5["states"][:].astype(np.float32)
 
     def __len__(self) -> int:
         return self.length - self.sequence_len
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
-        with h5py.File(self.path, "r") as h5:
-            frames = h5["frames"][index : index + self.sequence_len + 1]
-            actions = h5["actions"][index : index + self.sequence_len]
-            states = h5["states"][index : index + self.sequence_len]
-        frames = torch.from_numpy(frames.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
+        frames = torch.from_numpy(
+            self._frames[index : index + self.sequence_len + 1].astype(np.float32) / 255.0
+        ).permute(0, 3, 1, 2)
         return {
             "frames": frames,
-            "actions": torch.from_numpy(actions.astype(np.float32)),
-            "states": torch.from_numpy(states.astype(np.float32)),
+            "actions": torch.from_numpy(self._actions[index : index + self.sequence_len]),
+            "states": torch.from_numpy(self._states[index : index + self.sequence_len]),
         }
 
 
 class HDF5WindowDataset(Dataset):
+    """HDF5 窗口数据集。
+
+    使用每进程懒加载文件句柄：__init__ 只读取元数据，文件在第一次
+    __getitem__ 调用时按 DataLoader worker 进程独立打开，后续复用同
+    一句柄，彻底消除每次 __getitem__ 开关文件的 I/O 开销。
+    """
+
     def __init__(self, path: str | Path, split: str = "train") -> None:
         self.path = Path(path)
         self.split = split
@@ -64,21 +76,34 @@ class HDF5WindowDataset(Dataset):
                 raise ValueError(f"{split}/states 必须与 actions 形状一致 [N, T, 7]。")
             self.length = int(frames.shape[0])
             self.sequence_len = int(actions.shape[1])
+        # 每个 DataLoader worker 进程会各自独立设置此属性（fork 后赋值）。
+        self._h5: "h5py.File | None" = None
+
+    def _get_file(self) -> "h5py.File":
+        """懒加载：每个进程只打开一次 HDF5 文件，后续复用句柄。"""
+        if self._h5 is None:
+            self._h5 = h5py.File(self.path, "r")
+        return self._h5
+
+    def __del__(self) -> None:
+        if self._h5 is not None:
+            try:
+                self._h5.close()
+            except Exception:
+                pass
 
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
-        with h5py.File(self.path, "r") as h5:
-            group = h5[self.split]
-            frames = group["frames"][index]
-            actions = group["actions"][index]
-            states = group["states"][index]
-        frames = torch.from_numpy(frames.astype(np.float32) / 255.0).permute(0, 3, 1, 2)
+        group = self._get_file()[self.split]
+        frames = torch.from_numpy(
+            group["frames"][index].astype(np.float32) / 255.0
+        ).permute(0, 3, 1, 2)
         return {
             "frames": frames,
-            "actions": torch.from_numpy(actions.astype(np.float32)),
-            "states": torch.from_numpy(states.astype(np.float32)),
+            "actions": torch.from_numpy(group["actions"][index].astype(np.float32)),
+            "states": torch.from_numpy(group["states"][index].astype(np.float32)),
         }
 
 

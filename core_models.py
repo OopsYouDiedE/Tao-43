@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,6 +9,9 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
+
+# 如果设置了 VJEPA_DEBUG=1，则启用训练热路径上较慢的数据校验。
+_VJEPA_DEBUG: bool = os.environ.get("VJEPA_DEBUG", "0") == "1"
 
 
 PATCHES_PER_FRAME = 576
@@ -170,7 +174,8 @@ class VJEPAEncoder(nn.Module):
         batch, time, channels, height, width = frames.shape
         if channels != 3 or height != self.image_size or width != self.image_size:
             raise ValueError(f"期望 RGB {self.image_size}x{self.image_size} 格式的帧，实际得到 {tuple(frames.shape)}")
-        if frames.min().item() < -1e-6 or frames.max().item() > 1.0 + 1e-6:
+        # 像素范围校验会触发 GPU→CPU 同步，仅在 debug 模式下开启。
+        if _VJEPA_DEBUG and (frames.min().item() < -1e-6 or frames.max().item() > 1.0 + 1e-6):
             raise ValueError("VJEPAEncoder 期望像素值被归一化到 [0.0, 1.0] 范围内。")
 
         x = frames.to(self.device, non_blocking=True).reshape(batch * time, channels, height, width)
@@ -243,15 +248,33 @@ class ActionConditionedPredictor(nn.Module):
         self.output_norm = nn.LayerNorm(cfg.pred_dim)
         self.output_proj = nn.Linear(cfg.pred_dim, cfg.visual_dim)
 
+        # RoPE 频率缓存：inv_freq 不随梯度更新，作为 non-persistent buffer 随模型移动设备。
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, cfg.pred_dim, 2, dtype=torch.float32) / cfg.pred_dim)
+        )
+        self.register_buffer("_rope_inv_freq", inv_freq, persistent=False)
+        # (T, cos_cache, sin_cache) —— 内容按需延迟生成并高速缓存。
+        self._rope_cache: tuple[int, Tensor, Tensor] | None = None
+        # (num_frames, mask_tensor) —— 因果征因果逗留mask需重算空间浪费，也缓存。
+        self._mask_cache: tuple[int, Tensor] | None = None
+
     def forward(self, visual_tokens: Tensor, actions: Tensor, states: Tensor) -> Tensor:
         seq = self.interleave_tokens(visual_tokens, actions, states)
-        mask = self.build_block_causal_mask(
-            num_frames=visual_tokens.shape[1],
-            device=seq.device,
-        )
+        num_frames = visual_tokens.shape[1]
+        # 缓存 causal mask：假设 num_frames 在同一 epoch 内几乎不变，
+        # 避免每次 forward 重建 [T*578, T*578] 大型布尔张量。
+        if (
+            self._mask_cache is None
+            or self._mask_cache[0] != num_frames
+            or self._mask_cache[1].device != seq.device
+        ):
+            mask = self.build_block_causal_mask(num_frames, device=seq.device)
+            self._mask_cache = (num_frames, mask)
+        else:
+            mask = self._mask_cache[1]
         encoded = self.blocks(seq, mask=mask)
         encoded = self.output_norm(encoded)
-        visual_encoded = self.extract_visual_tokens(encoded, num_frames=visual_tokens.shape[1])
+        visual_encoded = self.extract_visual_tokens(encoded, num_frames=num_frames)
         return self.output_proj(visual_encoded)
 
     def interleave_tokens(self, visual_tokens: Tensor, actions: Tensor, states: Tensor) -> Tensor:
@@ -285,12 +308,24 @@ class ActionConditionedPredictor(nn.Module):
         if two_tokens != 2 or dim % 2 != 0:
             raise ValueError("RoPE 期望 [B, T, 2, 偶数维度] 的动作/状态 token。")
 
-        pos = torch.arange(time, device=tokens.device, dtype=tokens.dtype)
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=tokens.device, dtype=tokens.dtype) / dim))
-        angles = torch.outer(pos, inv_freq)
-        cos, sin = angles.cos().view(1, time, 1, -1), angles.sin().view(1, time, 1, -1)
+        # 使用 register_buffer 中的 inv_freq，并按 time 需延迟生成 cos/sin。
+        if (
+            self._rope_cache is None
+            or self._rope_cache[0] != time
+            or self._rope_inv_freq.device != tokens.device
+        ):
+            pos = torch.arange(time, device=self._rope_inv_freq.device,
+                               dtype=self._rope_inv_freq.dtype)
+            angles = torch.outer(pos, self._rope_inv_freq)          # [T, dim/2]
+            cos = angles.cos().view(1, time, 1, -1)                 # [1, T, 1, dim/2]
+            sin = angles.sin().view(1, time, 1, -1)
+            self._rope_cache = (time, cos, sin)
+        _, cos, sin = self._rope_cache
+        # AMP 场景下 tokens 可能是 float16，需要将缓存转换到同一 dtype。
+        cos = cos.to(dtype=tokens.dtype)
+        sin = sin.to(dtype=tokens.dtype)
+
         even, odd = tokens[..., 0::2], tokens[..., 1::2]
-        
         rotated = torch.empty_like(tokens)
         rotated[..., 0::2] = even * cos - odd * sin
         rotated[..., 1::2] = even * sin + odd * cos
